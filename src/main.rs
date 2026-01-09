@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -169,20 +169,9 @@ fn run_app<'a>(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: A
             match key.code {
                 KeyCode::Char('q') => return Ok(()),
                 KeyCode::Enter => {
-                    if event::poll(std::time::Duration::from_millis(100))? {
-                        if let Event::Key(KeyEvent {
-                            code: KeyCode::Enter,
-                            ..
-                        }) = event::read()?
-                        {
-                            if let Err(e) = app.execute_query() {
-                                app.status = format!("Error: {}", e);
-                            }
-                        } else {
-                            let second_key = event::read()?;
-                            if let Event::Key(k) = second_key {
-                                app.input.input(k);
-                            }
+                    if key.modifiers.contains(KeyModifiers::CONTROL) {
+                        if let Err(e) = app.execute_query() {
+                            app.status = format!("Error: {}", e);
                         }
                     } else {
                         app.input.insert_newline();
