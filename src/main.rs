@@ -179,8 +179,13 @@ fn run_app<'a>(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: A
                                 app.status = format!("Error: {}", e);
                             }
                         } else {
-                            app.input.insert_newline();
+                            let second_key = event::read()?;
+                            if let Event::Key(k) = second_key {
+                                app.input.input(k);
+                            }
                         }
+                    } else {
+                        app.input.insert_newline();
                     }
                 }
                 KeyCode::Esc => {
