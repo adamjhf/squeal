@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -49,7 +49,7 @@ impl<'a> App<'a> {
             conn,
             results: Vec::new(),
             headers: Vec::new(),
-            status: String::from("Ready"),
+            status: String::from("Ready (Ctrl-Enter to run, q to quit)"),
         })
     }
 
@@ -59,6 +59,8 @@ impl<'a> App<'a> {
             self.status = String::from("Empty query");
             return Ok(());
         }
+
+        self.status = String::from("Running query...");
 
         let mut stmt = self.conn.prepare(&sql).context("Failed to prepare statement")?;
         let column_names: Vec<String> = stmt
@@ -97,10 +99,10 @@ impl<'a> App<'a> {
                 }
                 self.headers = column_names;
                 self.results = results;
-                self.status = format!("{} rows returned", self.results.len());
+                self.status = format!("{} rows returned (Ctrl-Enter to run, q to quit)", self.results.len());
             }
             Err(e) => {
-                self.status = format!("Query error: {}", e);
+                self.status = format!("Query error: {} (Ctrl-Enter to run, q to quit)", e);
             }
         }
 
@@ -169,7 +171,9 @@ fn run_app<'a>(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: A
             match key.code {
                 KeyCode::Char('q') => return Ok(()),
                 KeyCode::Enter => {
-                    if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
+                        app.status = String::from("Running query...");
+                        terminal.draw(|f| ui(f, &app))?;
                         if let Err(e) = app.execute_query() {
                             app.status = format!("Error: {}", e);
                         }
