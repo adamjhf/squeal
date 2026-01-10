@@ -59,6 +59,13 @@ impl App {
             return Ok(());
         }
 
+        let statements: Vec<String> =
+            sql.split(';').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        if statements.is_empty() {
+            self.status = String::from("Empty query");
+            return Ok(());
+        }
+
         let db_path = self.database_path.clone();
 
         let result =
@@ -66,7 +73,27 @@ impl App {
                 let conn = Connection::open(&db_path)
                     .context("Failed to open database in background task")?;
 
-                let mut stmt = conn.prepare(&sql).context("Failed to prepare statement")?;
+                // Execute all statements except the last one
+                for stmt_sql in &statements[..statements.len() - 1] {
+                    let mut stmt = conn
+                        .prepare(stmt_sql)
+                        .context(format!("Failed to prepare statement: {}", stmt_sql))?;
+                    if stmt.column_count() > 0 {
+                        // SELECT-like statement: execute but discard results
+                        let _ = stmt
+                            .query_map([], |_| Ok(()))
+                            .context(format!("Failed to execute query: {}", stmt_sql))?;
+                    } else {
+                        // Non-SELECT statement: use execute
+                        conn.execute(stmt_sql, [])
+                            .context(format!("Failed to execute statement: {}", stmt_sql))?;
+                    }
+                }
+
+                // Prepare and execute the last statement to get results
+                let last_sql = &statements[statements.len() - 1];
+                let mut stmt =
+                    conn.prepare(last_sql).context("Failed to prepare last statement")?;
                 let column_names: Vec<String> =
                     stmt.column_names().iter().map(|s| s.to_string()).collect();
 
