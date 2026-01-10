@@ -24,17 +24,18 @@
         devRustToolchain =
           with fenix.packages.${system};
           combine [
-            stable.cargo
-            stable.rustc
-            stable.clippy
-            stable.rustfmt
+            latest.cargo
+            latest.rustc
+            latest.clippy
+            latest.rustfmt
+            latest.rust-src
           ];
 
         buildRustToolchain =
           with fenix.packages.${system};
           combine [
-            stable.cargo
-            stable.rustc
+            latest.cargo
+            latest.rustc
           ];
       in
       {

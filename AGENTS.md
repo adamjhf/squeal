@@ -89,8 +89,8 @@ cargo test -- --test-threads=1 # Run tests serially
 - **Async runtime**: Use Tokio for async execution
 - **Async patterns**: Prefer async/await over blocking operations where possible
 - **Zero warnings**: Always run `cargo check` after changes and fix any compilation errors or warnings before committing
-- **Edition**: Rust 2021
-- **Formatting**: Enforced via rustfmt
+- **Edition**: Rust 2024
+- **Formatting**: Enforced via rustfmt (requires nightly for full config)
 - **Linting**: Use clippy for additional code quality checks
 - **Error Handling**: Use `anyhow::Result<T>` with `.context()` for error propagation
 - No documentation updates unless explicitly requested
@@ -98,30 +98,36 @@ cargo test -- --test-threads=1 # Run tests serially
 
 ### Import Organization
 
-Group imports by crate, alphabetically sorted within groups. No blank lines between groups.
+Imports are automatically organized by rustfmt with `group_imports = "StdExternalCrate"`:
 
 ```rust
+use std::io;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
-    terminal::{disable_raw_mode, enable_raw_mode},
+    event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyModifiers},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use futures::StreamExt;
 use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    widgets::{Block, Borders, Table},
     Frame, Terminal,
+    backend::CrosstermBackend,
+    layout::{Alignment, Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
 };
 use rusqlite::Connection;
-use std::io;
+use tui_textarea::TextArea;
 ```
 
-**Rules**:
-- External crates first, then `std`
-- Multi-line imports use nested braces with 4-space indentation
+**Rules** (enforced by rustfmt):
+- `std` library imports first, separated by blank line
+- External crates alphabetically sorted
+- `imports_granularity = "Crate"` groups imports by crate
+- `imports_layout = "Mixed"` allows both single-line and multi-line as appropriate
 - No wildcard imports (`use foo::*`)
-- Alphabetical order within each crate's imports
 
 ### Formatting
 

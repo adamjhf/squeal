@@ -1,19 +1,21 @@
+use std::io;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use futures::StreamExt;
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
-    Frame, Terminal,
 };
 use rusqlite::Connection;
-use std::io;
 use tui_textarea::TextArea;
 
 #[derive(Parser)]
@@ -25,7 +27,7 @@ struct Cli {
 
 struct App<'a> {
     input: TextArea<'a>,
-    conn: Connection,
+    database_path: String,
     results: Vec<Vec<String>>,
     headers: Vec<String>,
     status: String,
@@ -33,7 +35,8 @@ struct App<'a> {
 
 impl<'a> App<'a> {
     fn new(database: &str) -> Result<Self> {
-        let conn = Connection::open(database).context("Failed to open database")?;
+        Connection::open(database).context("Failed to open database")?;
+
         let mut input = TextArea::default();
         input.set_cursor_line_style(Style::default());
         input.set_placeholder_text("Enter SQL query here...");
@@ -46,65 +49,67 @@ impl<'a> App<'a> {
 
         Ok(Self {
             input,
-            conn,
+            database_path: database.to_string(),
             results: Vec::new(),
             headers: Vec::new(),
             status: String::from("Ready (Ctrl-Enter to run, q to quit)"),
         })
     }
 
-    fn execute_query(&mut self) -> Result<()> {
+    async fn execute_query(&mut self) -> Result<()> {
         let sql = self.input.lines().join("\n");
         if sql.trim().is_empty() {
             self.status = String::from("Empty query");
             return Ok(());
         }
 
-        self.status = String::from("Running query...");
+        let db_path = self.database_path.clone();
 
-        let mut stmt = self.conn.prepare(&sql).context("Failed to prepare statement")?;
-        let column_names: Vec<String> = stmt
-            .column_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let result =
+            tokio::task::spawn_blocking(move || -> Result<(Vec<String>, Vec<Vec<String>>)> {
+                let conn = Connection::open(&db_path)
+                    .context("Failed to open database in background task")?;
 
-        let mut results = Vec::new();
-        let rows = stmt.query_map([], |row| {
-            let mut row_data = Vec::new();
-            for i in 0..row.as_ref().column_count() {
-                let value = match row.get_ref(i) {
-                    Ok(rusqlite::types::ValueRef::Null) => String::from("NULL"),
-                    Ok(rusqlite::types::ValueRef::Integer(i)) => i.to_string(),
-                    Ok(rusqlite::types::ValueRef::Real(f)) => f.to_string(),
-                    Ok(rusqlite::types::ValueRef::Text(s)) => String::from_utf8_lossy(s).to_string(),
-                    Ok(rusqlite::types::ValueRef::Blob(_)) => String::from("<BLOB>"),
-                    Err(_) => String::from("<ERROR>"),
-                };
-                row_data.push(value);
-            }
-            Ok(row_data)
-        });
+                let mut stmt = conn.prepare(&sql).context("Failed to prepare statement")?;
+                let column_names: Vec<String> =
+                    stmt.column_names().iter().map(|s| s.to_string()).collect();
 
-        match rows {
-            Ok(mut row_iter) => {
-                while let Some(row) = row_iter.next() {
-                    match row {
-                        Ok(r) => results.push(r),
-                        Err(e) => {
-                            self.status = format!("Error reading row: {}", e);
-                            return Ok(());
-                        }
+                let mut results = Vec::new();
+                let rows = stmt.query_map([], |row| {
+                    let mut row_data = Vec::new();
+                    for i in 0..row.as_ref().column_count() {
+                        let value = match row.get_ref(i) {
+                            Ok(rusqlite::types::ValueRef::Null) => String::from("NULL"),
+                            Ok(rusqlite::types::ValueRef::Integer(i)) => i.to_string(),
+                            Ok(rusqlite::types::ValueRef::Real(f)) => f.to_string(),
+                            Ok(rusqlite::types::ValueRef::Text(s)) => {
+                                String::from_utf8_lossy(s).to_string()
+                            },
+                            Ok(rusqlite::types::ValueRef::Blob(_)) => String::from("<BLOB>"),
+                            Err(_) => String::from("<ERROR>"),
+                        };
+                        row_data.push(value);
                     }
+                    Ok(row_data)
+                });
+
+                match rows {
+                    Ok(mut row_iter) => {
+                        for row in row_iter.by_ref() {
+                            results.push(row.context("Error reading row")?);
+                        }
+                        Ok((column_names, results))
+                    },
+                    Err(e) => Err(anyhow::anyhow!("Query error: {}", e)),
                 }
-                self.headers = column_names;
-                self.results = results;
-                self.status = format!("{} rows returned (Ctrl-Enter to run, q to quit)", self.results.len());
-            }
-            Err(e) => {
-                self.status = format!("Query error: {} (Ctrl-Enter to run, q to quit)", e);
-            }
-        }
+            })
+            .await
+            .context("Failed to execute background task")??;
+
+        self.headers = result.0;
+        self.results = result.1;
+        self.status =
+            format!("{} rows returned (Ctrl-Enter to run, q to quit)", self.results.len());
 
         Ok(())
     }
@@ -119,28 +124,19 @@ fn ui(f: &mut Frame, app: &App<'_>) {
 
     f.render_widget(&app.input, chunks[0]);
 
-    let title = if app.headers.is_empty() {
-        "Results (No data)"
-    } else {
-        "Results"
-    };
+    let title = if app.headers.is_empty() { "Results (No data)" } else { "Results" };
 
-    let header_style = Style::default()
-        .fg(Color::LightCyan)
-        .add_modifier(Modifier::BOLD);
+    let header_style = Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD);
 
     let table = Table::new(
-        app.results
-            .iter()
-            .enumerate()
-            .map(|(i, row)| {
-                let style = if i % 2 == 0 {
-                    Style::default().fg(Color::White)
-                } else {
-                    Style::default().fg(Color::Rgb(150, 150, 150))
-                };
-                Row::new(row.iter().map(|cell| Cell::from(cell.as_str()))).style(style)
-            }),
+        app.results.iter().enumerate().map(|(i, row)| {
+            let style = if i % 2 == 0 {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::Rgb(150, 150, 150))
+            };
+            Row::new(row.iter().map(|cell| Cell::from(cell.as_str()))).style(style)
+        }),
         &[
             Constraint::Length(20),
             Constraint::Length(20),
@@ -149,9 +145,7 @@ fn ui(f: &mut Frame, app: &App<'_>) {
             Constraint::Length(20),
         ],
     )
-    .header(
-        Row::new(app.headers.iter().map(|h| Cell::from(h.as_str()))).style(header_style)
-    )
+    .header(Row::new(app.headers.iter().map(|h| Cell::from(h.as_str()))).style(header_style))
     .block(Block::default().borders(Borders::ALL).title(title));
 
     f.render_widget(table, chunks[1]);
@@ -163,36 +157,44 @@ fn ui(f: &mut Frame, app: &App<'_>) {
     f.render_widget(status, chunks[2]);
 }
 
-fn run_app<'a>(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: App<'a>) -> Result<()> {
+async fn run_app<'a>(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    mut app: App<'a>,
+) -> Result<()> {
+    let mut event_reader = EventStream::new();
+
     loop {
         terminal.draw(|f| ui(f, &app))?;
 
-        if let Event::Key(key) = event::read()? {
+        if let Some(Ok(Event::Key(key))) = event_reader.next().await {
             match key.code {
                 KeyCode::Char('q') => return Ok(()),
                 KeyCode::Enter => {
-                    if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        || key.modifiers.contains(KeyModifiers::ALT)
+                    {
                         app.status = String::from("Running query...");
                         terminal.draw(|f| ui(f, &app))?;
-                        if let Err(e) = app.execute_query() {
+                        if let Err(e) = app.execute_query().await {
                             app.status = format!("Error: {}", e);
                         }
                     } else {
                         app.input.insert_newline();
                     }
-                }
+                },
                 KeyCode::Esc => {
                     app.input.cancel_selection();
-                }
+                },
                 _ => {
                     app.input.input(key);
-                }
+                },
             }
         }
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     enable_raw_mode()?;
@@ -203,14 +205,10 @@ fn main() -> Result<()> {
 
     let app = App::new(&cli.database).context("Failed to initialize app")?;
 
-    let res = run_app(&mut terminal, app);
+    let res = run_app(&mut terminal, app).await;
 
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
 
     res?;
