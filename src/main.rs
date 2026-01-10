@@ -7,7 +7,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use edtui::{EditorEventHandler, EditorState, EditorView, SyntaxHighlighter};
+use edtui::{EditorEventHandler, EditorMode, EditorState, EditorView, SyntaxHighlighter};
 use futures::StreamExt;
 use ratatui::{
     Frame, Terminal,
@@ -48,7 +48,7 @@ impl App {
             database_path: database.to_string(),
             results: Vec::new(),
             headers: Vec::new(),
-            status: String::from("Ready (Ctrl-Enter to run, Ctrl-q to quit)"),
+            status: String::from("Ready (Enter in Normal mode to run query, Ctrl-q to quit)"),
         })
     }
 
@@ -104,8 +104,10 @@ impl App {
 
         self.headers = result.0;
         self.results = result.1;
-        self.status =
-            format!("{} rows returned (Ctrl-Enter to run, Ctrl-q to quit)", self.results.len());
+        self.status = format!(
+            "{} rows returned (Enter in Normal mode to run query, Ctrl-q to quit)",
+            self.results.len()
+        );
 
         Ok(())
     }
@@ -171,10 +173,7 @@ async fn run_app(
                     KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(());
                     },
-                    KeyCode::Enter
-                        if key.modifiers.contains(KeyModifiers::CONTROL)
-                            || key.modifiers.contains(KeyModifiers::ALT) =>
-                    {
+                    KeyCode::Enter if matches!(app.editor_state.mode, EditorMode::Normal) => {
                         app.status = String::from("Running query...");
                         if let Err(e) = app.execute_query().await {
                             app.status = format!("Error: {}", e);
