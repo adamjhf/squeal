@@ -7,16 +7,17 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use edtui::{EditorEventHandler, EditorState, EditorView, SyntaxHighlighter};
 use futures::StreamExt;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout},
+    prelude::Widget,
     style::{Color, Modifier, Style},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
 };
 use rusqlite::Connection;
-use tui_textarea::TextArea;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -25,39 +26,34 @@ struct Cli {
     database: String,
 }
 
-struct App<'a> {
-    input: TextArea<'a>,
+struct App {
+    editor_state: EditorState,
+    event_handler: EditorEventHandler,
     database_path: String,
     results: Vec<Vec<String>>,
     headers: Vec<String>,
     status: String,
 }
 
-impl<'a> App<'a> {
+impl App {
     fn new(database: &str) -> Result<Self> {
         Connection::open(database).context("Failed to open database")?;
 
-        let mut input = TextArea::default();
-        input.set_cursor_line_style(Style::default());
-        input.set_placeholder_text("Enter SQL query here...");
-        input.set_block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("SQL Query")
-                .title_style(Style::default().fg(Color::Cyan)),
-        );
+        let editor_state = EditorState::default();
+        let event_handler = EditorEventHandler::default();
 
         Ok(Self {
-            input,
+            editor_state,
+            event_handler,
             database_path: database.to_string(),
             results: Vec::new(),
             headers: Vec::new(),
-            status: String::from("Ready (Ctrl-Enter to run, q to quit)"),
+            status: String::from("Ready (Ctrl-Enter to run, Ctrl-q to quit)"),
         })
     }
 
     async fn execute_query(&mut self) -> Result<()> {
-        let sql = self.input.lines().join("\n");
+        let sql = self.editor_state.lines.to_string();
         if sql.trim().is_empty() {
             self.status = String::from("Empty query");
             return Ok(());
@@ -109,20 +105,23 @@ impl<'a> App<'a> {
         self.headers = result.0;
         self.results = result.1;
         self.status =
-            format!("{} rows returned (Ctrl-Enter to run, q to quit)", self.results.len());
+            format!("{} rows returned (Ctrl-Enter to run, Ctrl-q to quit)", self.results.len());
 
         Ok(())
     }
 }
 
-fn ui(f: &mut Frame, app: &App<'_>) {
+fn ui(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([Constraint::Length(10), Constraint::Min(0), Constraint::Length(1)])
         .split(f.area());
 
-    f.render_widget(&app.input, chunks[0]);
+    let syntax_highlighter = SyntaxHighlighter::new("dracula", "sql").ok();
+    EditorView::new(&mut app.editor_state)
+        .syntax_highlighter(syntax_highlighter)
+        .render(chunks[0], f.buffer_mut());
 
     let title = if app.headers.is_empty() { "Results (No data)" } else { "Results" };
 
@@ -157,37 +156,39 @@ fn ui(f: &mut Frame, app: &App<'_>) {
     f.render_widget(status, chunks[2]);
 }
 
-async fn run_app<'a>(
+async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    mut app: App<'a>,
+    mut app: App,
 ) -> Result<()> {
     let mut event_reader = EventStream::new();
 
     loop {
-        terminal.draw(|f| ui(f, &app))?;
+        terminal.draw(|f| ui(f, &mut app))?;
 
-        if let Some(Ok(Event::Key(key))) = event_reader.next().await {
-            match key.code {
-                KeyCode::Char('q') => return Ok(()),
-                KeyCode::Enter => {
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        || key.modifiers.contains(KeyModifiers::ALT)
+        if let Some(Ok(event)) = event_reader.next().await {
+            match event {
+                Event::Key(key) => match key.code {
+                    KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(());
+                    },
+                    KeyCode::Enter
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            || key.modifiers.contains(KeyModifiers::ALT) =>
                     {
                         app.status = String::from("Running query...");
-                        terminal.draw(|f| ui(f, &app))?;
                         if let Err(e) = app.execute_query().await {
                             app.status = format!("Error: {}", e);
                         }
-                    } else {
-                        app.input.insert_newline();
-                    }
+                    },
+                    _ => {
+                        app.event_handler.on_key_event(key, &mut app.editor_state);
+                    },
                 },
-                KeyCode::Esc => {
-                    app.input.cancel_selection();
+                Event::Mouse(mouse_event) => {
+                    app.event_handler.on_mouse_event(mouse_event, &mut app.editor_state);
                 },
-                _ => {
-                    app.input.input(key);
-                },
+                Event::Resize(_, _) => {},
+                _ => {},
             }
         }
     }
