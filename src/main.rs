@@ -33,6 +33,12 @@ struct App {
     results: Vec<Vec<String>>,
     headers: Vec<String>,
     status: String,
+    current_row: usize,
+    current_col: usize,
+    vertical_scroll: usize,
+    horizontal_scroll: usize,
+    visible_rows: usize,
+    visible_cols: usize,
 }
 
 impl App {
@@ -49,6 +55,12 @@ impl App {
             results: Vec::new(),
             headers: Vec::new(),
             status: String::from("Ready (Enter in Normal mode to run query, Ctrl-q to quit)"),
+            current_row: 0,
+            current_col: 0,
+            vertical_scroll: 0,
+            horizontal_scroll: 0,
+            visible_rows: 10,
+            visible_cols: 5,
         })
     }
 
@@ -131,6 +143,10 @@ impl App {
 
         self.headers = result.0;
         self.results = result.1;
+        self.current_row = 0;
+        self.current_col = 0;
+        self.vertical_scroll = 0;
+        self.horizontal_scroll = 0;
         self.status = format!(
             "{} rows returned (Enter in Normal mode to run query, Ctrl-q to quit)",
             self.results.len()
@@ -152,31 +168,45 @@ fn ui(f: &mut Frame, app: &mut App) {
         .syntax_highlighter(syntax_highlighter)
         .render(chunks[0], f.buffer_mut());
 
+    app.visible_rows = (chunks[1].height as usize).saturating_sub(3);
+    app.visible_cols = (chunks[1].width / 10).max(1) as usize;
+
+    let results_area = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(chunks[1]);
+
     let title = if app.headers.is_empty() { "Results (No data)" } else { "Results" };
 
     let header_style = Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD);
 
+    let constraints: Vec<Constraint> = app.headers.iter().map(|_| Constraint::Min(10)).collect();
+
+    let start_row = app.vertical_scroll;
+    let end_row = (start_row + app.visible_rows).min(app.results.len());
+
     let table = Table::new(
-        app.results.iter().enumerate().map(|(i, row)| {
-            let style = if i % 2 == 0 {
-                Style::default().fg(Color::White)
-            } else {
-                Style::default().fg(Color::Rgb(150, 150, 150))
-            };
-            Row::new(row.iter().map(|cell| Cell::from(cell.as_str()))).style(style)
+        app.results[start_row..end_row].iter().enumerate().map(|(i, row)| {
+            let global_i = i + start_row;
+            Row::new(row.iter().enumerate().map(|(j, cell)| {
+                let base_style = if global_i % 2 == 0 {
+                    Style::default().fg(Color::White)
+                } else {
+                    Style::default().fg(Color::Rgb(150, 150, 150))
+                };
+                let mut cell = Cell::from(cell.as_str()).style(base_style);
+                if global_i == app.current_row && j == app.current_col {
+                    cell = cell.style(Style::default().fg(Color::Black).bg(Color::White));
+                }
+                cell
+            }))
         }),
-        &[
-            Constraint::Length(20),
-            Constraint::Length(20),
-            Constraint::Length(20),
-            Constraint::Length(20),
-            Constraint::Length(20),
-        ],
+        constraints,
     )
     .header(Row::new(app.headers.iter().map(|h| Cell::from(h.as_str()))).style(header_style))
     .block(Block::default().borders(Borders::ALL).title(title));
 
-    f.render_widget(table, chunks[1]);
+    f.render_widget(table, results_area[0]);
 
     let status = Paragraph::new(app.status.as_str())
         .style(Style::default().fg(Color::Yellow))
@@ -207,7 +237,54 @@ async fn run_app(
                         }
                     },
                     _ => {
-                        app.event_handler.on_key_event(key, &mut app.editor_state);
+                        if matches!(app.editor_state.mode, EditorMode::Normal)
+                            && !app.results.is_empty()
+                        {
+                            match key.code {
+                                KeyCode::Up => {
+                                    if app.current_row > 0 {
+                                        app.current_row -= 1;
+                                        if app.current_row < app.vertical_scroll {
+                                            app.vertical_scroll = app.current_row;
+                                        }
+                                    }
+                                },
+                                KeyCode::Down => {
+                                    if app.current_row + 1 < app.results.len() {
+                                        app.current_row += 1;
+                                        if app.current_row >= app.vertical_scroll + app.visible_rows
+                                        {
+                                            app.vertical_scroll =
+                                                app.current_row - app.visible_rows + 1;
+                                        }
+                                    }
+                                },
+                                KeyCode::Left => {
+                                    if app.current_col > 0 {
+                                        app.current_col -= 1;
+                                        if app.current_col < app.horizontal_scroll {
+                                            app.horizontal_scroll = app.current_col;
+                                        }
+                                    }
+                                },
+                                KeyCode::Right => {
+                                    if app.current_col + 1 < app.headers.len() {
+                                        app.current_col += 1;
+                                        if app.current_col
+                                            >= app.horizontal_scroll + app.visible_cols
+                                        {
+                                            app.horizontal_scroll =
+                                                app.current_col - app.visible_cols + 1;
+                                        }
+                                    }
+                                },
+                                _ => {
+                                    app.event_handler.on_key_event(key, &mut app.editor_state);
+                                },
+                            }
+                        } else {
+                            app.event_handler.on_key_event(key, &mut app.editor_state);
+                        }
                     },
                 },
                 Event::Mouse(mouse_event) => {
