@@ -516,7 +516,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         let popup_height = app.autocomplete.suggestions.len().min(8) as u16;
 
         let popup_x = chunks[0].x + cursor_col + 2;
-        let popup_y = chunks[0].y + cursor_row + 1;
+        let popup_y = chunks[0].y + cursor_row + 2;
 
         let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
 
