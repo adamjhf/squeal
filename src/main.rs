@@ -14,18 +14,121 @@ use futures::StreamExt;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     prelude::Widget,
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
+    widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap},
 };
 use rusqlite::Connection;
+
+const SQL_KEYWORDS: &[&str] = &[
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "CREATE",
+    "DROP",
+    "TABLE",
+    "INDEX",
+    "VIEW",
+    "JOIN",
+    "LEFT",
+    "RIGHT",
+    "INNER",
+    "OUTER",
+    "ON",
+    "AS",
+    "AND",
+    "OR",
+    "NOT",
+    "NULL",
+    "IS",
+    "IN",
+    "EXISTS",
+    "BETWEEN",
+    "LIKE",
+    "LIMIT",
+    "ORDER",
+    "BY",
+    "GROUP",
+    "HAVING",
+    "COUNT",
+    "SUM",
+    "AVG",
+    "MIN",
+    "MAX",
+    "DISTINCT",
+    "ASC",
+    "DESC",
+    "VALUES",
+    "INTO",
+    "SET",
+    "ALTER",
+    "ADD",
+    "COLUMN",
+    "PRIMARY",
+    "KEY",
+    "FOREIGN",
+    "REFERENCES",
+    "UNIQUE",
+    "DEFAULT",
+    "AUTOINCREMENT",
+    "IF",
+    "ELSE",
+    "CASE",
+    "WHEN",
+    "THEN",
+    "END",
+    "CAST",
+    "COALESCE",
+    "LENGTH",
+    "SUBSTR",
+    "UPPER",
+    "LOWER",
+    "TRIM",
+    "REPLACE",
+    "ROUND",
+    "ABS",
+    "RANDOM",
+    "DATE",
+    "TIME",
+    "DATETIME",
+    "JULIANDAY",
+    "STRFTIME",
+    "BEGIN",
+    "COMMIT",
+    "ROLLBACK",
+    "TRANSACTION",
+    "PRAGMA",
+    "EXPLAIN",
+    "QUERY",
+    "PLAN",
+    "VACUUM",
+    "ANALYZE",
+    "ATTACH",
+    "DETACH",
+    "REINDEX",
+];
+
+struct AutocompleteState {
+    suggestions: Vec<String>,
+    selected: usize,
+    visible: bool,
+}
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
     #[arg(value_name = "DATABASE")]
     database: String,
+}
+
+#[derive(PartialEq)]
+enum Pane {
+    Editor,
+    Results,
 }
 
 struct App {
@@ -41,15 +144,20 @@ struct App {
     horizontal_scroll: usize,
     visible_rows: usize,
     visible_cols: usize,
+    autocomplete: AutocompleteState,
+    schema: Vec<String>,
+    focus: Pane,
 }
 
 impl App {
     fn new(database: &str) -> Result<Self> {
-        Connection::open(database).context("Failed to open database")?;
+        let conn = Connection::open(database).context("Failed to open database")?;
 
         let mut editor_state = EditorState::default();
         editor_state.mode = EditorMode::Insert;
         let event_handler = EditorEventHandler::default();
+
+        let schema = Self::load_schema(&conn)?;
 
         Ok(Self {
             editor_state,
@@ -58,7 +166,7 @@ impl App {
             results: Vec::new(),
             headers: Vec::new(),
             status: String::from(
-                "Ready (Ctrl+Enter to run query, Ctrl+q to quit, Esc for Normal mode)",
+                "Ready (Ctrl+Enter to run query, Tab to switch focus, Ctrl+q to quit)",
             ),
             current_row: 0,
             current_col: 0,
@@ -66,7 +174,136 @@ impl App {
             horizontal_scroll: 0,
             visible_rows: 10,
             visible_cols: 5,
+            autocomplete: AutocompleteState {
+                suggestions: Vec::new(),
+                selected: 0,
+                visible: false,
+            },
+            schema,
+            focus: Pane::Editor,
         })
+    }
+
+    fn load_schema(conn: &Connection) -> Result<Vec<String>> {
+        let mut schema = Vec::new();
+
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .context("Failed to query tables")?;
+        let table_names: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .context("Failed to fetch tables")?
+            .filter_map(Result::ok)
+            .collect();
+
+        for table in &table_names {
+            schema.push(table.clone());
+
+            if let Ok(mut col_stmt) = conn.prepare(&format!("PRAGMA table_info({})", table)) {
+                let columns: Vec<String> =
+                    match col_stmt.query_map([], |row| row.get::<_, String>(1)) {
+                        Ok(rows) => rows.filter_map(Result::ok).collect(),
+                        Err(_) => Vec::new(),
+                    };
+                schema.extend(columns);
+            }
+        }
+
+        schema.sort();
+        schema.dedup();
+        Ok(schema)
+    }
+
+    fn update_autocomplete(&mut self) {
+        let text = self.editor_state.lines.to_string();
+        let cursor = &self.editor_state.cursor;
+        let line = cursor.row;
+        let col = cursor.col;
+
+        if line >= text.lines().count() {
+            self.autocomplete.visible = false;
+            return;
+        }
+
+        let current_line = text.lines().nth(line).unwrap_or("");
+        let before_cursor = &current_line[..col.min(current_line.len())];
+
+        let word_start = before_cursor
+            .rfind(|c: char| !c.is_alphanumeric() && c != '_')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let current_word = &before_cursor[word_start..];
+
+        if current_word.len() < 2 {
+            self.autocomplete.visible = false;
+            return;
+        }
+
+        let prefix = current_word.to_uppercase();
+        let mut suggestions: Vec<String> = SQL_KEYWORDS
+            .iter()
+            .filter(|&&kw| kw.starts_with(&prefix))
+            .map(|&s| s.to_string())
+            .collect();
+
+        let schema_suggestions: Vec<String> =
+            self.schema.iter().filter(|s| s.to_uppercase().starts_with(&prefix)).cloned().collect();
+
+        suggestions.extend(schema_suggestions);
+        suggestions.sort();
+        suggestions.dedup();
+
+        if suggestions.is_empty() {
+            self.autocomplete.visible = false;
+        } else {
+            self.autocomplete.suggestions = suggestions;
+            self.autocomplete.selected = 0;
+            self.autocomplete.visible = true;
+        }
+    }
+
+    fn accept_autocomplete(&mut self) {
+        if !self.autocomplete.visible || self.autocomplete.suggestions.is_empty() {
+            return;
+        }
+
+        let selected = self.autocomplete.selected.min(self.autocomplete.suggestions.len() - 1);
+        let suggestion = &self.autocomplete.suggestions[selected];
+
+        let cursor = &self.editor_state.cursor;
+        let line = cursor.row;
+        let col = cursor.col;
+
+        let text = self.editor_state.lines.to_string();
+        if line >= text.lines().count() {
+            return;
+        }
+
+        let current_line = text.lines().nth(line).unwrap_or("");
+        let before_cursor = &current_line[..col.min(current_line.len())];
+        let word_start = before_cursor
+            .rfind(|c: char| !c.is_alphanumeric() && c != '_')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+
+        for _ in word_start..col {
+            use crossterm::event::KeyEvent;
+            self.event_handler
+                .on_key_event(KeyEvent::from(KeyCode::Backspace), &mut self.editor_state);
+        }
+
+        for ch in suggestion.chars() {
+            use crossterm::event::KeyEvent;
+            if ch == ' ' {
+                self.event_handler
+                    .on_key_event(KeyEvent::from(KeyCode::Char(' ')), &mut self.editor_state);
+            } else {
+                self.event_handler
+                    .on_key_event(KeyEvent::from(KeyCode::Char(ch)), &mut self.editor_state);
+            }
+        }
+
+        self.autocomplete.visible = false;
     }
 
     async fn execute_query(&mut self) -> Result<()> {
@@ -152,10 +389,8 @@ impl App {
         self.current_col = 0;
         self.vertical_scroll = 0;
         self.horizontal_scroll = 0;
-        self.status = format!(
-            "{} rows returned (Enter in Normal mode to run query, Ctrl-q to quit)",
-            self.results.len()
-        );
+        self.status =
+            format!("{} rows returned (Tab to switch focus, Ctrl+q to quit)", self.results.len());
 
         Ok(())
     }
@@ -169,16 +404,20 @@ fn ui(f: &mut Frame, app: &mut App) {
         .split(f.area());
 
     let syntax_highlighter = SyntaxHighlighter::new("dracula", "sql").ok();
-    let (mode_str, border_color) = match app.editor_state.mode {
+    let (mode_str, _mode_border_color) = match app.editor_state.mode {
         EditorMode::Insert => ("INSERT", Color::Green),
         EditorMode::Normal => ("NORMAL", Color::White),
         EditorMode::Visual => ("VISUAL", Color::Yellow),
         _ => ("", Color::White),
     };
+    let focus_border_color = match app.focus {
+        Pane::Editor => Color::White,
+        Pane::Results => Color::Rgb(100, 100, 100),
+    };
     let editor_block = Block::default()
         .borders(Borders::ALL)
         .title(format!("Query ({}) ", mode_str))
-        .border_style(Style::default().fg(border_color));
+        .border_style(Style::default().fg(focus_border_color));
     let theme = EditorTheme::default()
         .base(Style::default().bg(Color::Reset))
         .hide_status_line()
@@ -237,7 +476,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             let row_slice = &row[start_col..end_col.min(row_end)];
             Row::new(row_slice.iter().enumerate().map(|(j, cell)| {
                 let local_j = j + start_col;
-                let base_style = if global_i % 2 == 0 {
+                let base_style = if global_i.is_multiple_of(2) {
                     Style::default().fg(Color::White)
                 } else {
                     Style::default().fg(Color::Rgb(150, 150, 150))
@@ -252,7 +491,12 @@ fn ui(f: &mut Frame, app: &mut App) {
         constraints,
     )
     .header(Row::new(headers_slice.iter().map(|h| Cell::from(h.as_str()))).style(header_style))
-    .block(Block::default().borders(Borders::ALL).title(title));
+    .block(Block::default().borders(Borders::ALL).title(title).border_style(
+        Style::default().fg(match app.focus {
+            Pane::Results => Color::White,
+            Pane::Editor => Color::Rgb(100, 100, 100),
+        }),
+    ));
 
     f.render_widget(table, chunks[1]);
 
@@ -261,6 +505,41 @@ fn ui(f: &mut Frame, app: &mut App) {
         .alignment(Alignment::Left)
         .wrap(Wrap { trim: true });
     f.render_widget(status, chunks[2]);
+
+    if app.autocomplete.visible && !app.autocomplete.suggestions.is_empty() {
+        let cursor = &app.editor_state.cursor;
+        let cursor_row = cursor.row as u16;
+        let cursor_col = cursor.col as u16;
+
+        let popup_width =
+            app.autocomplete.suggestions.iter().map(|s| s.len()).max().unwrap_or(20).max(20) as u16;
+        let popup_height = app.autocomplete.suggestions.len().min(8) as u16;
+
+        let popup_x = chunks[0].x + cursor_col + 2;
+        let popup_y = chunks[0].y + cursor_row + 1;
+
+        let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+        let items: Vec<ListItem> = app
+            .autocomplete
+            .suggestions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let style = if i == app.autocomplete.selected {
+                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                } else {
+                    Style::default().bg(Color::Black).fg(Color::White)
+                };
+                ListItem::new(s.as_str()).style(style)
+            })
+            .collect();
+
+        let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
+
+        f.render_widget(Clear, popup_area);
+        f.render_widget(list, popup_area);
+    }
 }
 
 async fn run_app(
@@ -292,7 +571,7 @@ async fn run_app(
                     {
                         match key.code {
                             KeyCode::Up => {
-                                if app.current_row > 0 {
+                                if app.focus == Pane::Results && app.current_row > 0 {
                                     app.current_row -= 1;
                                     if app.current_row < app.vertical_scroll {
                                         app.vertical_scroll = app.current_row;
@@ -300,7 +579,9 @@ async fn run_app(
                                 }
                             },
                             KeyCode::Down => {
-                                if app.current_row + 1 < app.results.len() {
+                                if app.focus == Pane::Results
+                                    && app.current_row + 1 < app.results.len()
+                                {
                                     app.current_row += 1;
                                     if app.current_row >= app.vertical_scroll + app.visible_rows {
                                         app.vertical_scroll =
@@ -309,36 +590,68 @@ async fn run_app(
                                 }
                             },
                             KeyCode::Left => {
-                                if app.horizontal_scroll > 0
-                                    && app.current_col == app.horizontal_scroll
-                                {
-                                    app.horizontal_scroll -= 1;
-                                    if app.current_col > 0 {
+                                if app.focus == Pane::Results {
+                                    if app.horizontal_scroll > 0
+                                        && app.current_col == app.horizontal_scroll
+                                    {
+                                        app.horizontal_scroll -= 1;
+                                        if app.current_col > 0 {
+                                            app.current_col -= 1;
+                                        }
+                                    } else if app.current_col > app.horizontal_scroll {
                                         app.current_col -= 1;
                                     }
-                                } else if app.current_col > app.horizontal_scroll {
-                                    app.current_col -= 1;
                                 }
                             },
                             KeyCode::Right => {
-                                if app.current_col + 1 == app.horizontal_scroll + app.visible_cols
-                                    && app.horizontal_scroll + app.visible_cols < app.headers.len()
-                                {
-                                    app.horizontal_scroll += 1;
-                                } else if app.current_col + 1 < app.headers.len() {
-                                    app.current_col += 1;
+                                if app.focus == Pane::Results {
+                                    if app.current_col + 1
+                                        == app.horizontal_scroll + app.visible_cols
+                                        && app.horizontal_scroll + app.visible_cols
+                                            < app.headers.len()
+                                    {
+                                        app.horizontal_scroll += 1;
+                                    } else if app.current_col + 1 < app.headers.len() {
+                                        app.current_col += 1;
+                                    }
                                 }
+                            },
+                            KeyCode::Tab => {
+                                app.focus = match app.focus {
+                                    Pane::Editor => Pane::Results,
+                                    Pane::Results => Pane::Editor,
+                                };
                             },
                             _ => {
                                 app.event_handler.on_key_event(key, &mut app.editor_state);
                             },
                         }
+                    } else if matches!(app.editor_state.mode, EditorMode::Normal) {
+                        if key.code == KeyCode::Tab {
+                            app.focus = match app.focus {
+                                Pane::Editor => Pane::Results,
+                                Pane::Results => Pane::Editor,
+                            };
+                        } else {
+                            app.event_handler.on_key_event(key, &mut app.editor_state);
+                        }
                     } else {
-                        app.event_handler.on_key_event(key, &mut app.editor_state);
+                        if key.code == KeyCode::Tab && app.autocomplete.visible {
+                            app.accept_autocomplete();
+                        } else if key.code == KeyCode::Down && app.autocomplete.visible {
+                            app.autocomplete.selected = (app.autocomplete.selected + 1)
+                                .min(app.autocomplete.suggestions.len().saturating_sub(1));
+                        } else if key.code == KeyCode::Up && app.autocomplete.visible {
+                            app.autocomplete.selected = app.autocomplete.selected.saturating_sub(1);
+                        } else {
+                            app.event_handler.on_key_event(key, &mut app.editor_state);
+                            app.update_autocomplete();
+                        }
                     }
                 },
                 Event::Mouse(mouse_event) => {
                     app.event_handler.on_mouse_event(mouse_event, &mut app.editor_state);
+                    app.update_autocomplete();
                 },
                 Event::Resize(_, _) => {},
                 _ => {},
