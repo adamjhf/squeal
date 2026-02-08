@@ -43,6 +43,7 @@
           buildInputs = with pkgs; [
             devRustToolchain
             rust-analyzer
+            cargo-watch
           ];
 
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.libiconv ];
