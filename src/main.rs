@@ -7,7 +7,9 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use edtui::{EditorEventHandler, EditorMode, EditorState, EditorView, SyntaxHighlighter};
+use edtui::{
+    EditorEventHandler, EditorMode, EditorState, EditorTheme, EditorView, SyntaxHighlighter,
+};
 use futures::StreamExt;
 use ratatui::{
     Frame, Terminal,
@@ -45,7 +47,8 @@ impl App {
     fn new(database: &str) -> Result<Self> {
         Connection::open(database).context("Failed to open database")?;
 
-        let editor_state = EditorState::default();
+        let mut editor_state = EditorState::default();
+        editor_state.mode = EditorMode::Insert;
         let event_handler = EditorEventHandler::default();
 
         Ok(Self {
@@ -54,7 +57,9 @@ impl App {
             database_path: database.to_string(),
             results: Vec::new(),
             headers: Vec::new(),
-            status: String::from("Ready (Enter in Normal mode to run query, Ctrl-q to quit)"),
+            status: String::from(
+                "Ready (Ctrl+Enter to run query, Ctrl+q to quit, Esc for Normal mode)",
+            ),
             current_row: 0,
             current_col: 0,
             vertical_scroll: 0,
@@ -164,38 +169,81 @@ fn ui(f: &mut Frame, app: &mut App) {
         .split(f.area());
 
     let syntax_highlighter = SyntaxHighlighter::new("dracula", "sql").ok();
+    let (mode_str, border_color) = match app.editor_state.mode {
+        EditorMode::Insert => ("INSERT", Color::Green),
+        EditorMode::Normal => ("NORMAL", Color::White),
+        EditorMode::Visual => ("VISUAL", Color::Yellow),
+        _ => ("", Color::White),
+    };
+    let editor_block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("Query ({}) ", mode_str))
+        .border_style(Style::default().fg(border_color));
+    let theme = EditorTheme::default()
+        .base(Style::default().bg(Color::Reset))
+        .hide_status_line()
+        .block(editor_block);
     EditorView::new(&mut app.editor_state)
         .syntax_highlighter(syntax_highlighter)
+        .theme(theme)
         .render(chunks[0], f.buffer_mut());
 
     app.visible_rows = (chunks[1].height as usize).saturating_sub(3);
-    app.visible_cols = (chunks[1].width / 10).max(1) as usize;
-
-    let results_area = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
-        .split(chunks[1]);
 
     let title = if app.headers.is_empty() { "Results (No data)" } else { "Results" };
 
     let header_style = Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD);
 
-    let constraints: Vec<Constraint> = app.headers.iter().map(|_| Constraint::Min(10)).collect();
+    // Calculate column widths: max of header and data lengths, minimum 30
+    let mut widths = vec![];
+    for j in 0..app.headers.len() {
+        let mut max_len = app.headers[j].len();
+        for row in &app.results {
+            if j < row.len() {
+                max_len = max_len.max(row[j].len());
+            }
+        }
+        widths.push(max_len as u16);
+    }
 
     let start_row = app.vertical_scroll;
     let end_row = (start_row + app.visible_rows).min(app.results.len());
+    let start_col = app.horizontal_scroll;
+
+    // Determine how many columns fit in the available width
+    let available_width = chunks[1].width as usize;
+    let mut cumulative = 0;
+    let mut num_visible = 0;
+    for &w in &widths[start_col..] {
+        if cumulative + w as usize <= available_width {
+            cumulative += w as usize;
+            num_visible += 1;
+        } else {
+            break;
+        }
+    }
+    app.visible_cols = num_visible;
+    let end_col = (start_col + num_visible).min(app.headers.len());
+
+    let headers_slice = &app.headers[start_col..end_col];
+    let widths_slice = &widths[start_col..end_col];
+    let constraints: Vec<Constraint> =
+        widths_slice.iter().map(|&w| Constraint::Length(w)).collect();
 
     let table = Table::new(
         app.results[start_row..end_row].iter().enumerate().map(|(i, row)| {
             let global_i = i + start_row;
-            Row::new(row.iter().enumerate().map(|(j, cell)| {
+            let row_end = start_col + headers_slice.len().min(row.len().saturating_sub(start_col));
+            let row_slice = &row[start_col..end_col.min(row_end)];
+            Row::new(row_slice.iter().enumerate().map(|(j, cell)| {
+                let local_j = j + start_col;
                 let base_style = if global_i % 2 == 0 {
                     Style::default().fg(Color::White)
                 } else {
                     Style::default().fg(Color::Rgb(150, 150, 150))
                 };
                 let mut cell = Cell::from(cell.as_str()).style(base_style);
-                if global_i == app.current_row && j == app.current_col {
+                if global_i == app.current_row && local_j == app.current_col {
                     cell = cell.style(Style::default().fg(Color::Black).bg(Color::White));
                 }
                 cell
@@ -203,10 +251,10 @@ fn ui(f: &mut Frame, app: &mut App) {
         }),
         constraints,
     )
-    .header(Row::new(app.headers.iter().map(|h| Cell::from(h.as_str()))).style(header_style))
+    .header(Row::new(headers_slice.iter().map(|h| Cell::from(h.as_str()))).style(header_style))
     .block(Block::default().borders(Borders::ALL).title(title));
 
-    f.render_widget(table, results_area[0]);
+    f.render_widget(table, chunks[1]);
 
     let status = Paragraph::new(app.status.as_str())
         .style(Style::default().fg(Color::Yellow))
@@ -226,66 +274,68 @@ async fn run_app(
 
         if let Some(Ok(event)) = event_reader.next().await {
             match event {
-                Event::Key(key) => match key.code {
-                    KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Event::Key(key) => {
+                    if key.code == KeyCode::Char('q')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
                         return Ok(());
-                    },
-                    KeyCode::Enter if matches!(app.editor_state.mode, EditorMode::Normal) => {
+                    }
+                    if key.code == KeyCode::Enter
+                        && matches!(app.editor_state.mode, EditorMode::Normal)
+                    {
                         app.status = String::from("Running query...");
                         if let Err(e) = app.execute_query().await {
                             app.status = format!("Error: {}", e);
                         }
-                    },
-                    _ => {
-                        if matches!(app.editor_state.mode, EditorMode::Normal)
-                            && !app.results.is_empty()
-                        {
-                            match key.code {
-                                KeyCode::Up => {
-                                    if app.current_row > 0 {
-                                        app.current_row -= 1;
-                                        if app.current_row < app.vertical_scroll {
-                                            app.vertical_scroll = app.current_row;
-                                        }
+                    } else if matches!(app.editor_state.mode, EditorMode::Normal)
+                        && !app.results.is_empty()
+                    {
+                        match key.code {
+                            KeyCode::Up => {
+                                if app.current_row > 0 {
+                                    app.current_row -= 1;
+                                    if app.current_row < app.vertical_scroll {
+                                        app.vertical_scroll = app.current_row;
                                     }
-                                },
-                                KeyCode::Down => {
-                                    if app.current_row + 1 < app.results.len() {
-                                        app.current_row += 1;
-                                        if app.current_row >= app.vertical_scroll + app.visible_rows
-                                        {
-                                            app.vertical_scroll =
-                                                app.current_row - app.visible_rows + 1;
-                                        }
+                                }
+                            },
+                            KeyCode::Down => {
+                                if app.current_row + 1 < app.results.len() {
+                                    app.current_row += 1;
+                                    if app.current_row >= app.vertical_scroll + app.visible_rows {
+                                        app.vertical_scroll =
+                                            app.current_row - app.visible_rows + 1;
                                     }
-                                },
-                                KeyCode::Left => {
+                                }
+                            },
+                            KeyCode::Left => {
+                                if app.horizontal_scroll > 0
+                                    && app.current_col == app.horizontal_scroll
+                                {
+                                    app.horizontal_scroll -= 1;
                                     if app.current_col > 0 {
                                         app.current_col -= 1;
-                                        if app.current_col < app.horizontal_scroll {
-                                            app.horizontal_scroll = app.current_col;
-                                        }
                                     }
-                                },
-                                KeyCode::Right => {
-                                    if app.current_col + 1 < app.headers.len() {
-                                        app.current_col += 1;
-                                        if app.current_col
-                                            >= app.horizontal_scroll + app.visible_cols
-                                        {
-                                            app.horizontal_scroll =
-                                                app.current_col - app.visible_cols + 1;
-                                        }
-                                    }
-                                },
-                                _ => {
-                                    app.event_handler.on_key_event(key, &mut app.editor_state);
-                                },
-                            }
-                        } else {
-                            app.event_handler.on_key_event(key, &mut app.editor_state);
+                                } else if app.current_col > app.horizontal_scroll {
+                                    app.current_col -= 1;
+                                }
+                            },
+                            KeyCode::Right => {
+                                if app.current_col + 1 == app.horizontal_scroll + app.visible_cols
+                                    && app.horizontal_scroll + app.visible_cols < app.headers.len()
+                                {
+                                    app.horizontal_scroll += 1;
+                                } else if app.current_col + 1 < app.headers.len() {
+                                    app.current_col += 1;
+                                }
+                            },
+                            _ => {
+                                app.event_handler.on_key_event(key, &mut app.editor_state);
+                            },
                         }
-                    },
+                    } else {
+                        app.event_handler.on_key_event(key, &mut app.editor_state);
+                    }
                 },
                 Event::Mouse(mouse_event) => {
                     app.event_handler.on_mouse_event(mouse_event, &mut app.editor_state);
