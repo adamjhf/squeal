@@ -215,6 +215,11 @@ impl App {
     }
 
     fn update_autocomplete(&mut self) {
+        if !matches!(self.editor_state.mode, EditorMode::Insert) {
+            self.autocomplete.visible = false;
+            return;
+        }
+
         let text = self.editor_state.lines.to_string();
         let cursor = &self.editor_state.cursor;
         let line = cursor.row;
@@ -263,6 +268,11 @@ impl App {
     }
 
     fn accept_autocomplete(&mut self) {
+        if !matches!(self.editor_state.mode, EditorMode::Insert) {
+            self.autocomplete.visible = false;
+            return;
+        }
+
         if !self.autocomplete.visible || self.autocomplete.suggestions.is_empty() {
             return;
         }
@@ -506,7 +516,10 @@ fn ui(f: &mut Frame, app: &mut App) {
         .wrap(Wrap { trim: true });
     f.render_widget(status, chunks[2]);
 
-    if app.autocomplete.visible && !app.autocomplete.suggestions.is_empty() {
+    if matches!(app.editor_state.mode, EditorMode::Insert)
+        && app.autocomplete.visible
+        && !app.autocomplete.suggestions.is_empty()
+    {
         let cursor = &app.editor_state.cursor;
         let cursor_row = cursor.row as u16;
         let cursor_col = cursor.col as u16;
@@ -636,12 +649,21 @@ async fn run_app(
                             app.event_handler.on_key_event(key, &mut app.editor_state);
                         }
                     } else {
-                        if key.code == KeyCode::Tab && app.autocomplete.visible {
+                        if matches!(app.editor_state.mode, EditorMode::Insert)
+                            && key.code == KeyCode::Tab
+                            && app.autocomplete.visible
+                        {
                             app.accept_autocomplete();
-                        } else if key.code == KeyCode::Down && app.autocomplete.visible {
+                        } else if matches!(app.editor_state.mode, EditorMode::Insert)
+                            && key.code == KeyCode::Down
+                            && app.autocomplete.visible
+                        {
                             app.autocomplete.selected = (app.autocomplete.selected + 1)
                                 .min(app.autocomplete.suggestions.len().saturating_sub(1));
-                        } else if key.code == KeyCode::Up && app.autocomplete.visible {
+                        } else if matches!(app.editor_state.mode, EditorMode::Insert)
+                            && key.code == KeyCode::Up
+                            && app.autocomplete.visible
+                        {
                             app.autocomplete.selected = app.autocomplete.selected.saturating_sub(1);
                         } else {
                             app.event_handler.on_key_event(key, &mut app.editor_state);
