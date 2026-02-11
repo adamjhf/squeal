@@ -427,6 +427,17 @@ impl App {
         }
     }
 
+    fn save_current_query_on_exit(&mut self) {
+        let query = self.current_query();
+        if query.trim().is_empty() {
+            return;
+        }
+        if self.query_history.last().is_some_and(|q| q == &query) {
+            return;
+        }
+        self.append_run_query_to_history(&query);
+    }
+
     fn new_query(&mut self) {
         let current = self.current_query();
         self.append_run_query_to_history(&current);
@@ -962,9 +973,18 @@ async fn run_app(
         if let Some(Ok(event)) = event_reader.next().await {
             match event {
                 Event::Key(key) => {
-                    if key.code == KeyCode::Char('q')
+                    if matches!(app.editor_state.mode, EditorMode::Insert)
+                        && key.code == KeyCode::Char('q')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
+                        app.save_current_query_on_exit();
+                        return Ok(());
+                    }
+                    if matches!(app.editor_state.mode, EditorMode::Normal)
+                        && key.code == KeyCode::Char('q')
+                        && key.modifiers.is_empty()
+                    {
+                        app.save_current_query_on_exit();
                         return Ok(());
                     }
                     if matches!(app.editor_state.mode, EditorMode::Normal)
