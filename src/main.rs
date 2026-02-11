@@ -1,4 +1,7 @@
-use std::io;
+use std::{
+    env, fs, io,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -8,7 +11,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use edtui::{
-    EditorEventHandler, EditorMode, EditorState, EditorTheme, EditorView, SyntaxHighlighter,
+    EditorEventHandler, EditorMode, EditorState, EditorTheme, EditorView, Lines, SyntaxHighlighter,
 };
 use futures::StreamExt;
 use ratatui::{
@@ -112,10 +115,23 @@ const SQL_KEYWORDS: &[&str] = &[
     "REINDEX",
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletionKind {
+    Keyword,
+    Table,
+    Column,
+}
+
 struct AutocompleteState {
     suggestions: Vec<String>,
     selected: usize,
     visible: bool,
+}
+
+struct Schema {
+    tables: Vec<String>,
+    columns: Vec<String>,
+    columns_by_table: std::collections::HashMap<String, Vec<String>>,
 }
 
 #[derive(Parser)]
@@ -145,8 +161,12 @@ struct App {
     visible_rows: usize,
     visible_cols: usize,
     autocomplete: AutocompleteState,
-    schema: Vec<String>,
+    schema: Schema,
     focus: Pane,
+    query_history: Vec<String>,
+    history_index: Option<usize>,
+    history_draft: Option<String>,
+    history_path: PathBuf,
 }
 
 impl App {
@@ -158,6 +178,8 @@ impl App {
         let event_handler = EditorEventHandler::default();
 
         let schema = Self::load_schema(&conn)?;
+        let history_path = history_file_path()?;
+        let query_history = load_query_history(&history_path)?;
 
         Ok(Self {
             editor_state,
@@ -181,11 +203,17 @@ impl App {
             },
             schema,
             focus: Pane::Editor,
+            query_history,
+            history_index: None,
+            history_draft: None,
+            history_path,
         })
     }
 
-    fn load_schema(conn: &Connection) -> Result<Vec<String>> {
-        let mut schema = Vec::new();
+    fn load_schema(conn: &Connection) -> Result<Schema> {
+        let mut tables = Vec::new();
+        let mut columns = Vec::new();
+        let mut columns_by_table = std::collections::HashMap::<String, Vec<String>>::new();
 
         let mut stmt = conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table'")
@@ -197,21 +225,25 @@ impl App {
             .collect();
 
         for table in &table_names {
-            schema.push(table.clone());
+            tables.push(table.clone());
 
             if let Ok(mut col_stmt) = conn.prepare(&format!("PRAGMA table_info({})", table)) {
-                let columns: Vec<String> =
+                let table_columns: Vec<String> =
                     match col_stmt.query_map([], |row| row.get::<_, String>(1)) {
                         Ok(rows) => rows.filter_map(Result::ok).collect(),
                         Err(_) => Vec::new(),
                     };
-                schema.extend(columns);
+                columns.extend(table_columns.iter().cloned());
+                columns_by_table.insert(table.to_lowercase(), table_columns);
             }
         }
 
-        schema.sort();
-        schema.dedup();
-        Ok(schema)
+        tables.sort();
+        tables.dedup();
+        columns.sort();
+        columns.dedup();
+
+        Ok(Schema { tables, columns, columns_by_table })
     }
 
     fn update_autocomplete(&mut self) {
@@ -239,22 +271,47 @@ impl App {
             .unwrap_or(0);
         let current_word = &before_cursor[word_start..];
 
-        if current_word.len() < 2 {
+        let before_text = text_before_cursor(&text, line, before_cursor);
+        let statement_before =
+            before_text.rsplit_once(';').map(|(_, s)| s).unwrap_or(before_text.as_str());
+        let kind = completion_kind(statement_before);
+        let qualifier = qualifier_before_word(before_cursor, word_start);
+
+        let min_prefix_len = match kind {
+            CompletionKind::Table => 0,
+            CompletionKind::Column if qualifier.is_some() => 0,
+            CompletionKind::Column => 0,
+            CompletionKind::Keyword => 2,
+        };
+        if current_word.len() < min_prefix_len {
             self.autocomplete.visible = false;
             return;
         }
 
-        let prefix = current_word.to_uppercase();
-        let mut suggestions: Vec<String> = SQL_KEYWORDS
-            .iter()
-            .filter(|&&kw| kw.starts_with(&prefix))
-            .map(|&s| s.to_string())
-            .collect();
+        let prefix_upper = current_word.to_uppercase();
+        let mut suggestions = Vec::<String>::new();
 
-        let schema_suggestions: Vec<String> =
-            self.schema.iter().filter(|s| s.to_uppercase().starts_with(&prefix)).cloned().collect();
+        match kind {
+            CompletionKind::Table => {
+                suggestions.extend(self.schema.tables.iter().cloned());
+            },
+            CompletionKind::Column => {
+                if let Some(q) = qualifier
+                    && let Some(cols) = self.schema.columns_by_table.get(&q.to_lowercase())
+                {
+                    suggestions.extend(cols.iter().cloned());
+                } else {
+                    suggestions.extend(self.schema.columns.iter().cloned());
+                }
+            },
+            CompletionKind::Keyword => {
+                suggestions.extend(SQL_KEYWORDS.iter().map(|&s| s.to_string()));
+            },
+        }
 
-        suggestions.extend(schema_suggestions);
+        if !prefix_upper.is_empty() {
+            suggestions.retain(|s| s.to_uppercase().starts_with(&prefix_upper));
+        }
         suggestions.sort();
         suggestions.dedup();
 
@@ -265,6 +322,109 @@ impl App {
             self.autocomplete.selected = 0;
             self.autocomplete.visible = true;
         }
+    }
+
+    fn current_query(&self) -> String {
+        self.editor_state.lines.to_string()
+    }
+
+    fn set_query(&mut self, query: &str) {
+        self.editor_state.lines = Lines::from(query);
+        self.editor_state.selection = None;
+        let last_row = self.editor_state.lines.len().saturating_sub(1);
+        let last_col = self.editor_state.lines.len_col(last_row).unwrap_or_default();
+        self.editor_state.cursor.row = last_row;
+        self.editor_state.cursor.col = last_col;
+    }
+
+    fn history_len(&self) -> usize {
+        self.query_history.len() + usize::from(self.history_draft.is_some())
+    }
+
+    fn history_entry(&self, index: usize) -> Option<&str> {
+        if index < self.query_history.len() {
+            return self.query_history.get(index).map(String::as_str);
+        }
+        if index == self.query_history.len() {
+            return self.history_draft.as_deref();
+        }
+        None
+    }
+
+    fn ensure_history_draft(&mut self) {
+        if self.history_draft.is_some() {
+            return;
+        }
+        let current = self.current_query();
+        let last_run = self.query_history.last().map(String::as_str).unwrap_or("");
+        if current != last_run {
+            self.history_draft = Some(current);
+        }
+    }
+
+    fn history_prev(&mut self) {
+        self.ensure_history_draft();
+        let len = self.history_len();
+        if len == 0 {
+            return;
+        }
+
+        let next_index = match self.history_index {
+            Some(i) if i > 0 => i - 1,
+            Some(_) => 0,
+            None => self.query_history.len().saturating_sub(1),
+        };
+        self.history_index = Some(next_index);
+        if let Some(entry) = self.history_entry(next_index).map(ToString::to_string) {
+            self.set_query(&entry);
+        }
+    }
+
+    fn history_next(&mut self) {
+        let Some(index) = self.history_index else {
+            return;
+        };
+
+        self.ensure_history_draft();
+        let len = self.history_len();
+        if len == 0 {
+            self.history_index = None;
+            return;
+        }
+
+        if index + 1 >= len {
+            self.history_index = None;
+            if let Some(draft) = self.history_draft.clone() {
+                self.set_query(&draft);
+            }
+            return;
+        }
+
+        let next_index = index + 1;
+        self.history_index = Some(next_index);
+        if let Some(entry) = self.history_entry(next_index).map(ToString::to_string) {
+            self.set_query(&entry);
+        }
+    }
+
+    fn append_run_query_to_history(&mut self, query: &str) {
+        if query.trim().is_empty() {
+            return;
+        }
+        self.query_history.push(query.to_string());
+        self.history_index = None;
+        self.history_draft = None;
+        if let Err(e) = save_query_history(&self.history_path, &self.query_history) {
+            self.status = format!("Warning: failed to save history: {}", e);
+        }
+    }
+
+    fn new_query(&mut self) {
+        let current = self.current_query();
+        self.append_run_query_to_history(&current);
+        self.set_query("");
+        self.autocomplete.visible = false;
+        self.status = String::from("New query");
     }
 
     fn accept_autocomplete(&mut self) {
@@ -322,6 +482,7 @@ impl App {
             self.status = String::from("Empty query");
             return Ok(());
         }
+        self.append_run_query_to_history(&sql);
 
         let statements: Vec<String> =
             sql.split(';').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
@@ -404,6 +565,100 @@ impl App {
 
         Ok(())
     }
+}
+
+fn history_file_path() -> Result<PathBuf> {
+    if let Ok(dir) = env::var("SQUEAL_CONFIG_DIR") {
+        return Ok(Path::new(&dir).join("history"));
+    }
+    if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
+        return Ok(Path::new(&xdg).join("squeal").join("history"));
+    }
+    let home = env::var("HOME").context("HOME not set")?;
+    Ok(Path::new(&home).join(".config").join("squeal").join("history"))
+}
+
+fn load_query_history(path: &Path) -> Result<Vec<String>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let bytes = fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    Ok(bytes
+        .split(|b| *b == 0)
+        .filter(|chunk| !chunk.is_empty())
+        .map(|chunk| String::from_utf8_lossy(chunk).to_string())
+        .collect())
+}
+
+fn save_query_history(path: &Path, history: &[String]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    let data = history.join("\0");
+    fs::write(path, data).with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn completion_kind(statement_before: &str) -> CompletionKind {
+    let words = uppercase_words(statement_before);
+    let mut kind = CompletionKind::Keyword;
+    for w in words {
+        match w.as_str() {
+            "SELECT" => kind = CompletionKind::Column,
+            "FROM" | "JOIN" | "INTO" | "UPDATE" => kind = CompletionKind::Table,
+            "ON" => kind = CompletionKind::Column,
+            "WHERE" | "GROUP" | "ORDER" | "HAVING" | "LIMIT" => {
+                kind = CompletionKind::Keyword;
+            },
+            _ => {},
+        }
+    }
+    kind
+}
+
+fn uppercase_words(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            cur.push(ch.to_ascii_uppercase());
+        } else if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn text_before_cursor(text: &str, line: usize, before_cursor: &str) -> String {
+    let mut out = String::new();
+    for (i, l) in text.lines().enumerate() {
+        if i < line {
+            out.push_str(l);
+            out.push('\n');
+        } else if i == line {
+            out.push_str(before_cursor);
+            break;
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn qualifier_before_word(before_cursor: &str, word_start: usize) -> Option<String> {
+    if word_start == 0 {
+        return None;
+    }
+    let prefix = &before_cursor[..word_start];
+    let prefix = prefix.strip_suffix('.')?;
+    let q_start =
+        prefix.rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_').map(|i| i + 1).unwrap_or(0);
+    let q = prefix[q_start..].trim();
+    if q.is_empty() { None } else { Some(q.to_string()) }
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
@@ -603,7 +858,9 @@ async fn run_app(
                                 }
                             },
                             KeyCode::Left => {
-                                if app.focus == Pane::Results {
+                                if app.focus == Pane::Editor {
+                                    app.history_prev();
+                                } else if app.focus == Pane::Results {
                                     if app.horizontal_scroll > 0
                                         && app.current_col == app.horizontal_scroll
                                     {
@@ -617,7 +874,9 @@ async fn run_app(
                                 }
                             },
                             KeyCode::Right => {
-                                if app.focus == Pane::Results {
+                                if app.focus == Pane::Editor {
+                                    app.history_next();
+                                } else if app.focus == Pane::Results {
                                     if app.current_col + 1
                                         == app.horizontal_scroll + app.visible_cols
                                         && app.horizontal_scroll + app.visible_cols
@@ -635,6 +894,27 @@ async fn run_app(
                                     Pane::Results => Pane::Editor,
                                 };
                             },
+                            KeyCode::Char('h') => {
+                                if app.focus == Pane::Editor {
+                                    app.history_prev();
+                                } else {
+                                    app.event_handler.on_key_event(key, &mut app.editor_state);
+                                }
+                            },
+                            KeyCode::Char('l') => {
+                                if app.focus == Pane::Editor {
+                                    app.history_next();
+                                } else {
+                                    app.event_handler.on_key_event(key, &mut app.editor_state);
+                                }
+                            },
+                            KeyCode::Char('n') => {
+                                if app.focus == Pane::Editor {
+                                    app.new_query();
+                                } else {
+                                    app.event_handler.on_key_event(key, &mut app.editor_state);
+                                }
+                            },
                             _ => {
                                 app.event_handler.on_key_event(key, &mut app.editor_state);
                             },
@@ -645,6 +925,16 @@ async fn run_app(
                                 Pane::Editor => Pane::Results,
                                 Pane::Results => Pane::Editor,
                             };
+                        } else if key.code == KeyCode::Left && app.focus == Pane::Editor {
+                            app.history_prev();
+                        } else if key.code == KeyCode::Right && app.focus == Pane::Editor {
+                            app.history_next();
+                        } else if key.code == KeyCode::Char('h') && app.focus == Pane::Editor {
+                            app.history_prev();
+                        } else if key.code == KeyCode::Char('l') && app.focus == Pane::Editor {
+                            app.history_next();
+                        } else if key.code == KeyCode::Char('n') && app.focus == Pane::Editor {
+                            app.new_query();
                         } else {
                             app.event_handler.on_key_event(key, &mut app.editor_state);
                         }
@@ -667,6 +957,8 @@ async fn run_app(
                             app.autocomplete.selected = app.autocomplete.selected.saturating_sub(1);
                         } else {
                             app.event_handler.on_key_event(key, &mut app.editor_state);
+                            app.history_index = None;
+                            app.history_draft = None;
                             app.update_autocomplete();
                         }
                     }

@@ -1796,20 +1796,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sqlite-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "crossterm",
- "edtui",
- "futures",
- "ratatui",
- "rusqlite",
- "tokio",
-]
-
-[[package]]
 name = "sqlite-wasm-rs"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1820,6 +1806,20 @@ dependencies = [
  "js-sys",
  "thiserror 2.0.17",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "squeal"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossterm",
+ "edtui",
+ "futures",
+ "ratatui",
+ "rusqlite",
+ "tokio",
 ]
 
 [[package]]
