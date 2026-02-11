@@ -185,13 +185,14 @@ impl App {
         let event_handler = EditorEventHandler::default();
 
         let schema = Self::load_schema(&conn)?;
-        let history_path = history_file_path()?;
+        let resolved_database_path = resolve_database_path(database)?;
+        let history_path = history_file_path_for_database(&resolved_database_path)?;
         let query_history = load_query_history(&history_path)?;
 
-        Ok(Self {
+        let mut app = Self {
             editor_state,
             event_handler,
-            database_path: database.to_string(),
+            database_path: resolved_database_path.to_string_lossy().to_string(),
             results: Vec::new(),
             headers: Vec::new(),
             status: String::from(
@@ -215,7 +216,14 @@ impl App {
             history_draft: None,
             history_path,
             table_picker: TablePickerState { visible: false, filter: String::new(), selected: 0 },
-        })
+        };
+
+        if let Some(last_query) = app.query_history.last().cloned() {
+            app.set_query(&last_query);
+            app.status = String::from("Loaded latest query from history");
+        }
+
+        Ok(app)
     }
 
     fn load_schema(conn: &Connection) -> Result<Schema> {
@@ -669,15 +677,84 @@ impl App {
     }
 }
 
-fn history_file_path() -> Result<PathBuf> {
+fn history_root_dir() -> Result<PathBuf> {
     if let Ok(dir) = env::var("SQUEAL_CONFIG_DIR") {
-        return Ok(Path::new(&dir).join("history"));
+        return Ok(Path::new(&dir).to_path_buf());
     }
     if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
-        return Ok(Path::new(&xdg).join("squeal").join("history"));
+        return Ok(Path::new(&xdg).join("squeal"));
     }
     let home = env::var("HOME").context("HOME not set")?;
-    Ok(Path::new(&home).join(".config").join("squeal").join("history"))
+    Ok(Path::new(&home).join(".config").join("squeal"))
+}
+
+fn resolve_database_path(database: &str) -> Result<PathBuf> {
+    let path = Path::new(database);
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Ok(env::current_dir().context("Failed to read current directory")?.join(path))
+}
+
+fn history_file_path_for_database(database_path: &Path) -> Result<PathBuf> {
+    let root = history_root_dir()?;
+    let history_dir = root.join("history-by-db");
+    let candidates = history_file_candidates(&history_dir, database_path);
+    if let Some(existing) = candidates.iter().find(|p| p.exists()) {
+        return Ok(existing.clone());
+    }
+    Ok(candidates
+        .first()
+        .cloned()
+        .unwrap_or_else(|| history_file_path_with_key(&history_dir, database_path)))
+}
+
+fn history_file_candidates(history_dir: &Path, database_path: &Path) -> Vec<PathBuf> {
+    let mut keys = Vec::<PathBuf>::new();
+
+    if let Ok(canonical) = fs::canonicalize(database_path) {
+        keys.push(canonical);
+    }
+    keys.push(database_path.to_path_buf());
+
+    let mut files = Vec::new();
+    for key in keys {
+        let path = history_file_path_with_key(history_dir, &key);
+        if !files.iter().any(|p: &PathBuf| p == &path) {
+            files.push(path);
+        }
+    }
+    files
+}
+
+fn history_file_path_with_key(history_dir: &Path, database_path: &Path) -> PathBuf {
+    let db_key = database_path.to_string_lossy();
+    let hash = stable_hash64(db_key.as_bytes());
+    let name = sanitize_history_name(
+        database_path.file_name().and_then(|s| s.to_str()).unwrap_or("database"),
+    );
+    history_dir.join(format!("{}-{:016x}.history", name, hash))
+}
+
+fn sanitize_history_name(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() { String::from("database") } else { out }
+}
+
+fn stable_hash64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 14695981039346656037;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    hash
 }
 
 fn load_query_history(path: &Path) -> Result<Vec<String>> {
