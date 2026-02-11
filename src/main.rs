@@ -850,7 +850,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         .constraints([Constraint::Length(10), Constraint::Min(0), Constraint::Length(1)])
         .split(f.area());
 
-    let syntax_highlighter = SyntaxHighlighter::new("dracula", "sql").ok();
+    let syntax_highlighter = SyntaxHighlighter::new("one-dark", "sql").ok();
     let (mode_str, _mode_border_color) = match app.editor_state.mode {
         EditorMode::Insert => ("INSERT", Color::Green),
         EditorMode::Normal => ("NORMAL", Color::White),
