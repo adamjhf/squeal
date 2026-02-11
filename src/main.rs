@@ -427,6 +427,9 @@ impl App {
         if query.trim().is_empty() {
             return;
         }
+        if self.query_history.last().is_some_and(|last| last == query) {
+            return;
+        }
         self.query_history.push(query.to_string());
         self.history_index = None;
         self.history_draft = None;
