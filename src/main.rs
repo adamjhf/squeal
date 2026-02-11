@@ -940,10 +940,15 @@ async fn run_app(
                         }
                     } else {
                         if matches!(app.editor_state.mode, EditorMode::Insert)
-                            && key.code == KeyCode::Tab
+                            && (key.code == KeyCode::Tab || key.code == KeyCode::Enter)
                             && app.autocomplete.visible
                         {
                             app.accept_autocomplete();
+                        } else if matches!(app.editor_state.mode, EditorMode::Insert)
+                            && key.code == KeyCode::Esc
+                            && app.autocomplete.visible
+                        {
+                            app.autocomplete.visible = false;
                         } else if matches!(app.editor_state.mode, EditorMode::Insert)
                             && key.code == KeyCode::Down
                             && app.autocomplete.visible
