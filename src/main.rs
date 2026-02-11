@@ -134,6 +134,12 @@ struct Schema {
     columns_by_table: std::collections::HashMap<String, Vec<String>>,
 }
 
+struct TablePickerState {
+    visible: bool,
+    filter: String,
+    selected: usize,
+}
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -167,6 +173,7 @@ struct App {
     history_index: Option<usize>,
     history_draft: Option<String>,
     history_path: PathBuf,
+    table_picker: TablePickerState,
 }
 
 impl App {
@@ -207,6 +214,7 @@ impl App {
             history_index: None,
             history_draft: None,
             history_path,
+            table_picker: TablePickerState { visible: false, filter: String::new(), selected: 0 },
         })
     }
 
@@ -425,6 +433,89 @@ impl App {
         self.set_query("");
         self.autocomplete.visible = false;
         self.status = String::from("New query");
+    }
+
+    fn filtered_tables(&self) -> Vec<String> {
+        let filter = self.table_picker.filter.to_lowercase();
+        self.schema
+            .tables
+            .iter()
+            .filter(|t| filter.is_empty() || t.to_lowercase().contains(&filter))
+            .cloned()
+            .collect()
+    }
+
+    fn open_table_picker(&mut self) {
+        self.table_picker.visible = true;
+        self.table_picker.filter.clear();
+        self.table_picker.selected = 0;
+        self.status = String::from("Table picker: type to filter, Enter to select");
+    }
+
+    fn close_table_picker(&mut self) {
+        self.table_picker.visible = false;
+        self.table_picker.filter.clear();
+        self.table_picker.selected = 0;
+    }
+
+    fn table_picker_move_up(&mut self) {
+        self.table_picker.selected = self.table_picker.selected.saturating_sub(1);
+    }
+
+    fn table_picker_move_down(&mut self) {
+        let len = self.filtered_tables().len();
+        if len == 0 {
+            self.table_picker.selected = 0;
+            return;
+        }
+        self.table_picker.selected = (self.table_picker.selected + 1).min(len - 1);
+    }
+
+    fn table_picker_push_filter(&mut self, ch: char) {
+        self.table_picker.filter.push(ch);
+        self.table_picker.selected = 0;
+    }
+
+    fn table_picker_pop_filter(&mut self) {
+        self.table_picker.filter.pop();
+        self.table_picker.selected = 0;
+    }
+
+    fn table_picker_apply_selection(&mut self) -> bool {
+        let tables = self.filtered_tables();
+        if tables.is_empty() {
+            return false;
+        }
+        let idx = self.table_picker.selected.min(tables.len() - 1);
+        let table = tables[idx].clone();
+        let columns =
+            self.schema.columns_by_table.get(&table.to_lowercase()).cloned().unwrap_or_default();
+        let select_clause = if columns.is_empty() { "*".to_string() } else { columns.join(", ") };
+        let query = format!("select {} from {} limit 100;", select_clause, table);
+        self.set_query(&query);
+        self.close_table_picker();
+        self.status = format!("Loaded table query: {}", table);
+        true
+    }
+
+    fn handle_table_picker_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc => self.close_table_picker(),
+            KeyCode::Enter => {
+                return self.table_picker_apply_selection();
+            },
+            KeyCode::Up => self.table_picker_move_up(),
+            KeyCode::Down => self.table_picker_move_down(),
+            KeyCode::Backspace => self.table_picker_pop_filter(),
+            KeyCode::Char(ch)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.table_picker_push_filter(ch);
+            },
+            _ => {},
+        }
+        false
     }
 
     fn accept_autocomplete(&mut self) {
@@ -808,6 +899,55 @@ fn ui(f: &mut Frame, app: &mut App) {
         f.render_widget(Clear, popup_area);
         f.render_widget(list, popup_area);
     }
+
+    if matches!(app.editor_state.mode, EditorMode::Normal) && app.table_picker.visible {
+        let tables = app.filtered_tables();
+        let area = f.area();
+        let width: u16 = 56;
+        let height: u16 = 16;
+        let popup_width = width.min(area.width.saturating_sub(2));
+        let popup_height = height.min(area.height.saturating_sub(2));
+        let popup_x = area.x + area.width.saturating_sub(popup_width) / 2;
+        let popup_y = area.y + area.height.saturating_sub(popup_height) / 2;
+        let popup = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+        f.render_widget(Clear, popup);
+        let block = Block::default().borders(Borders::ALL).title("Tables");
+        f.render_widget(block, popup);
+
+        let inner = Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        );
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(inner);
+
+        let filter = Paragraph::new(format!("Filter: {}", app.table_picker.filter))
+            .style(Style::default().fg(Color::Yellow));
+        f.render_widget(filter, sections[0]);
+
+        let items: Vec<ListItem> = if tables.is_empty() {
+            vec![ListItem::new("<no tables>").style(Style::default().fg(Color::DarkGray))]
+        } else {
+            tables
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let style = if i == app.table_picker.selected {
+                        Style::default().bg(Color::DarkGray).fg(Color::White)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    ListItem::new(t.as_str()).style(style)
+                })
+                .collect()
+        };
+        f.render_widget(List::new(items), sections[1]);
+    }
 }
 
 async fn run_app(
@@ -826,6 +966,17 @@ async fn run_app(
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         return Ok(());
+                    }
+                    if matches!(app.editor_state.mode, EditorMode::Normal)
+                        && app.table_picker.visible
+                    {
+                        if app.handle_table_picker_key(key) {
+                            app.status = String::from("Running query...");
+                            if let Err(e) = app.execute_query().await {
+                                app.status = format!("Error: {}", e);
+                            }
+                        }
+                        continue;
                     }
                     if key.code == KeyCode::Enter
                         && matches!(app.editor_state.mode, EditorMode::Normal)
@@ -915,6 +1066,9 @@ async fn run_app(
                                     app.event_handler.on_key_event(key, &mut app.editor_state);
                                 }
                             },
+                            KeyCode::Char('t') => {
+                                app.open_table_picker();
+                            },
                             _ => {
                                 app.event_handler.on_key_event(key, &mut app.editor_state);
                             },
@@ -935,6 +1089,8 @@ async fn run_app(
                             app.history_next();
                         } else if key.code == KeyCode::Char('n') && app.focus == Pane::Editor {
                             app.new_query();
+                        } else if key.code == KeyCode::Char('t') {
+                            app.open_table_picker();
                         } else {
                             app.event_handler.on_key_event(key, &mut app.editor_state);
                         }
