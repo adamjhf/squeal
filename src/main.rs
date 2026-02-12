@@ -617,23 +617,24 @@ impl App {
                 for stmt_sql in &statements[..statements.len() - 1] {
                     let mut stmt = conn
                         .prepare(stmt_sql)
-                        .context(format!("Failed to prepare statement: {}", stmt_sql))?;
+                        .map_err(|e| anyhow::anyhow!(format_sql_error(&e, stmt_sql)))?;
                     if stmt.column_count() > 0 {
                         // SELECT-like statement: execute but discard results
                         let _ = stmt
                             .query_map([], |_| Ok(()))
-                            .context(format!("Failed to execute query: {}", stmt_sql))?;
+                            .map_err(|e| anyhow::anyhow!(format_sql_error(&e, stmt_sql)))?;
                     } else {
                         // Non-SELECT statement: use execute
                         conn.execute(stmt_sql, [])
-                            .context(format!("Failed to execute statement: {}", stmt_sql))?;
+                            .map_err(|e| anyhow::anyhow!(format_sql_error(&e, stmt_sql)))?;
                     }
                 }
 
                 // Prepare and execute the last statement to get results
                 let last_sql = &statements[statements.len() - 1];
-                let mut stmt =
-                    conn.prepare(last_sql).context("Failed to prepare last statement")?;
+                let mut stmt = conn
+                    .prepare(last_sql)
+                    .map_err(|e| anyhow::anyhow!(format_sql_error(&e, last_sql)))?;
                 let column_names: Vec<String> =
                     stmt.column_names().iter().map(|s| s.to_string()).collect();
 
@@ -663,7 +664,7 @@ impl App {
                         }
                         Ok((column_names, results))
                     },
-                    Err(e) => Err(anyhow::anyhow!("Query error: {}", e)),
+                    Err(e) => Err(anyhow::anyhow!(format_sql_error(&e, last_sql))),
                 }
             })
             .await
@@ -782,6 +783,39 @@ fn save_query_history(path: &Path, history: &[String]) -> Result<()> {
     let data = history.join("\0");
     fs::write(path, data).with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
+}
+
+fn format_sql_error(err: &rusqlite::Error, sql: &str) -> String {
+    let msg = err.to_string();
+    let sql_excerpt = truncate_right(sql.trim(), 80);
+    let lower = msg.to_lowercase();
+
+    if lower.contains("syntax error") || lower.contains("incomplete input") {
+        return format!("SQL syntax error: {}. Query: {}", msg, sql_excerpt);
+    }
+    if lower.contains("no such table") {
+        return format!("Table not found: {}. Query: {}", msg, sql_excerpt);
+    }
+    if lower.contains("no such column") {
+        return format!("Column not found: {}. Query: {}", msg, sql_excerpt);
+    }
+    if lower.contains("near \"") {
+        return format!("SQL parse error: {}. Query: {}", msg, sql_excerpt);
+    }
+
+    format!("SQL error: {}. Query: {}", msg, sql_excerpt)
+}
+
+fn format_user_error(e: &anyhow::Error) -> String {
+    let msg = e.to_string();
+    if msg.starts_with("SQL ")
+        || msg.starts_with("Table not found")
+        || msg.starts_with("Column not found")
+    {
+        msg
+    } else {
+        format!("Error: {}", msg)
+    }
 }
 
 fn completion_kind(statement_before: &str) -> CompletionKind {
@@ -1142,7 +1176,7 @@ async fn run_app(
                         if app.handle_table_picker_key(key) {
                             app.status = String::from("Running query...");
                             if let Err(e) = app.execute_query().await {
-                                app.status = format!("Error: {}", e);
+                                app.status = format_user_error(&e);
                             }
                         }
                         continue;
@@ -1152,7 +1186,7 @@ async fn run_app(
                     {
                         app.status = String::from("Running query...");
                         if let Err(e) = app.execute_query().await {
-                            app.status = format!("Error: {}", e);
+                            app.status = format_user_error(&e);
                         }
                     } else if matches!(app.editor_state.mode, EditorMode::Normal)
                         && !app.results.is_empty()
