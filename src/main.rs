@@ -843,6 +843,32 @@ fn qualifier_before_word(before_cursor: &str, word_start: usize) -> Option<Strin
     if q.is_empty() { None } else { Some(q.to_string()) }
 }
 
+fn truncate_left(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    if max == 1 {
+        return "…".to_string();
+    }
+    format!("…{}", &s[s.len() - (max - 1)..])
+}
+
+fn truncate_right(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    if max == 1 {
+        return "…".to_string();
+    }
+    format!("{}…", &s[..max - 1])
+}
+
 fn ui(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -947,7 +973,17 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     f.render_widget(table, chunks[1]);
 
-    let status = Paragraph::new(app.status.as_str())
+    let width = chunks[2].width as usize;
+    let right = truncate_left(&app.database_path, width);
+    let status_text = if width <= right.len() {
+        right
+    } else {
+        let left_max = width.saturating_sub(right.len() + 1);
+        let left = truncate_right(&app.status, left_max);
+        let spaces = width.saturating_sub(left.len() + right.len());
+        format!("{}{}{}", left, " ".repeat(spaces), right)
+    };
+    let status = Paragraph::new(status_text)
         .style(Style::default().fg(Color::Yellow))
         .alignment(Alignment::Left)
         .wrap(Wrap { trim: true });
