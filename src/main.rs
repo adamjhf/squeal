@@ -20,6 +20,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     prelude::Widget,
     style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap},
 };
 use rusqlite::Connection;
@@ -147,7 +148,7 @@ struct Cli {
     database: String,
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 enum Pane {
     Editor,
     Results,
@@ -195,9 +196,7 @@ impl App {
             database_path: resolved_database_path.to_string_lossy().to_string(),
             results: Vec::new(),
             headers: Vec::new(),
-            status: String::from(
-                "Ready (Ctrl+Enter to run query, Tab to switch focus, Ctrl+q to quit)",
-            ),
+            status: String::from("ready"),
             current_row: 0,
             current_col: 0,
             vertical_scroll: 0,
@@ -676,8 +675,7 @@ impl App {
         self.current_col = 0;
         self.vertical_scroll = 0;
         self.horizontal_scroll = 0;
-        self.status =
-            format!("{} rows returned (Tab to switch focus, Ctrl+q to quit)", self.results.len());
+        self.status = format!("{} rows returned", self.results.len());
 
         Ok(())
     }
@@ -923,29 +921,56 @@ fn truncate_right(s: &str, max: usize) -> String {
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
+    let bg = Color::Reset;
+    let text_primary = Color::Rgb(212, 220, 232);
+    let text_muted = Color::Rgb(138, 152, 171);
+    let accent = Color::White;
+    let accent_soft = Color::Rgb(130, 130, 130);
+    let insert_accent = Color::Rgb(152, 195, 121);
+    let warn = Color::Rgb(229, 192, 123);
+    let select_bg = Color::Rgb(56, 63, 79);
+    let panel_bg = Color::Rgb(28, 32, 40);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
-        .constraints([Constraint::Length(10), Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(10),
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(f.area());
 
     let syntax_highlighter = SyntaxHighlighter::new("one-dark", "sql").ok();
-    let (mode_str, _mode_border_color) = match app.editor_state.mode {
-        EditorMode::Insert => ("INSERT", Color::Green),
-        EditorMode::Normal => ("NORMAL", Color::White),
-        EditorMode::Visual => ("VISUAL", Color::Yellow),
-        _ => ("", Color::White),
+    let mode_str = match app.editor_state.mode {
+        EditorMode::Insert => "INSERT",
+        EditorMode::Normal => "NORMAL",
+        EditorMode::Visual => "VISUAL",
+        _ => "",
     };
-    let focus_border_color = match app.focus {
-        Pane::Editor => Color::White,
-        Pane::Results => Color::Rgb(100, 100, 100),
+    let focus_border_color = match (app.focus, app.editor_state.mode) {
+        (Pane::Editor, EditorMode::Insert) => insert_accent,
+        (Pane::Editor, _) => accent,
+        (Pane::Results, EditorMode::Insert) => Color::Rgb(98, 122, 84),
+        (Pane::Results, _) => accent_soft,
+    };
+    let title_color = match app.editor_state.mode {
+        EditorMode::Insert => insert_accent,
+        EditorMode::Normal => accent,
+        EditorMode::Visual => warn,
+        _ => accent,
     };
     let editor_block = Block::default()
         .borders(Borders::ALL)
-        .title(format!("Query ({}) ", mode_str))
+        .title(" Query ")
+        .title(Line::from(format!(" {} ", mode_str.to_lowercase())).alignment(Alignment::Right))
+        .title_style(Style::default().fg(title_color).add_modifier(Modifier::BOLD))
         .border_style(Style::default().fg(focus_border_color));
     let theme = EditorTheme::default()
-        .base(Style::default().bg(Color::Reset))
+        .base(Style::default().bg(bg).fg(text_primary))
+        .line_numbers_style(Style::default().fg(text_muted))
+        .cursor_style(Style::default().bg(select_bg).fg(text_primary).add_modifier(Modifier::BOLD))
         .hide_status_line()
         .block(editor_block);
     EditorView::new(&mut app.editor_state)
@@ -955,9 +980,9 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     app.visible_rows = (chunks[1].height as usize).saturating_sub(3);
 
-    let title = if app.headers.is_empty() { "Results (No data)" } else { "Results" };
+    let title = if app.headers.is_empty() { " Results (No data) " } else { " Results " };
 
-    let header_style = Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD);
+    let header_style = Style::default().fg(accent).add_modifier(Modifier::BOLD);
 
     // Calculate column widths: max of header and data lengths, minimum 30
     let mut widths = vec![];
@@ -1004,13 +1029,13 @@ fn ui(f: &mut Frame, app: &mut App) {
             Row::new(row_slice.iter().enumerate().map(|(j, cell)| {
                 let local_j = j + start_col;
                 let base_style = if global_i.is_multiple_of(2) {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(text_primary)
                 } else {
-                    Style::default().fg(Color::Rgb(150, 150, 150))
+                    Style::default().fg(text_muted)
                 };
                 let mut cell = Cell::from(cell.as_str()).style(base_style);
                 if global_i == app.current_row && local_j == app.current_col {
-                    cell = cell.style(Style::default().fg(Color::Black).bg(Color::White));
+                    cell = cell.style(Style::default().fg(text_primary).bg(select_bg));
                 }
                 cell
             }))
@@ -1020,15 +1045,51 @@ fn ui(f: &mut Frame, app: &mut App) {
     .header(Row::new(headers_slice.iter().map(|h| Cell::from(h.as_str()))).style(header_style))
     .block(Block::default().borders(Borders::ALL).title(title).border_style(
         Style::default().fg(match app.focus {
-            Pane::Results => Color::White,
-            Pane::Editor => Color::Rgb(100, 100, 100),
+            Pane::Results => accent,
+            Pane::Editor => accent_soft,
         }),
     ));
 
     f.render_widget(table, chunks[1]);
 
-    let width = chunks[2].width as usize;
-    let right = truncate_left(&app.database_path, width);
+    let key_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+    let hint_style = Style::default().fg(text_muted);
+    let hints_spans: Vec<Span> = match app.editor_state.mode {
+        EditorMode::Insert => vec![
+            Span::styled("esc", key_style),
+            Span::styled(" normal  ", hint_style),
+            Span::styled("ctrl+q", key_style),
+            Span::styled(" quit  ", hint_style),
+            Span::styled("tab/enter", key_style),
+            Span::styled(" accept suggestion  ", hint_style),
+            Span::styled("up/down", key_style),
+            Span::styled(" navigate suggestion", hint_style),
+        ],
+        _ => vec![
+            Span::styled("q", key_style),
+            Span::styled(" quit  ", hint_style),
+            Span::styled("enter", key_style),
+            Span::styled(" run  ", hint_style),
+            Span::styled("tab", key_style),
+            Span::styled(" focus  ", hint_style),
+            Span::styled("left/right", key_style),
+            Span::styled(" history  ", hint_style),
+            Span::styled("h/l", key_style),
+            Span::styled(" history  ", hint_style),
+            Span::styled("n", key_style),
+            Span::styled(" new query  ", hint_style),
+            Span::styled("t", key_style),
+            Span::styled(" tables", hint_style),
+        ],
+    };
+    let hints_line = Paragraph::new(Line::from(hints_spans))
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: true });
+    f.render_widget(hints_line, chunks[2]);
+
+    let width = chunks[3].width as usize;
+    let right_full = app.database_path.clone();
+    let right = truncate_left(&right_full, width);
     let status_text = if width <= right.len() {
         right
     } else {
@@ -1038,10 +1099,10 @@ fn ui(f: &mut Frame, app: &mut App) {
         format!("{}{}{}", left, " ".repeat(spaces), right)
     };
     let status = Paragraph::new(status_text)
-        .style(Style::default().fg(Color::Yellow))
+        .style(Style::default().fg(warn))
         .alignment(Alignment::Left)
         .wrap(Wrap { trim: true });
-    f.render_widget(status, chunks[2]);
+    f.render_widget(status, chunks[3]);
 
     if matches!(app.editor_state.mode, EditorMode::Insert)
         && app.autocomplete.visible
@@ -1077,15 +1138,15 @@ fn ui(f: &mut Frame, app: &mut App) {
                 .enumerate()
                 .map(|(i, s)| {
                     let style = if i == app.autocomplete.selected {
-                        Style::default().bg(Color::DarkGray).fg(Color::White)
+                        Style::default().bg(select_bg).fg(text_primary)
                     } else {
-                        Style::default().bg(Color::Black).fg(Color::White)
+                        Style::default().bg(panel_bg).fg(text_primary)
                     };
                     ListItem::new(s.as_str()).style(style)
                 })
                 .collect();
 
-            let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
+            let list = List::new(items).highlight_style(Style::default().bg(select_bg));
 
             f.render_widget(Clear, popup_area);
             f.render_widget(list, popup_area);
@@ -1105,7 +1166,10 @@ fn ui(f: &mut Frame, app: &mut App) {
 
         if popup.width >= 3 && popup.height >= 3 {
             f.render_widget(Clear, popup);
-            let block = Block::default().borders(Borders::ALL).title("Tables");
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(" Tables ")
+                .border_style(Style::default().fg(accent));
             f.render_widget(block, popup);
 
             let inner = Rect::new(
@@ -1120,20 +1184,20 @@ fn ui(f: &mut Frame, app: &mut App) {
                 .split(inner);
 
             let filter = Paragraph::new(format!("Filter: {}", app.table_picker.filter))
-                .style(Style::default().fg(Color::Yellow));
+                .style(Style::default().fg(warn));
             f.render_widget(filter, sections[0]);
 
             let items: Vec<ListItem> = if tables.is_empty() {
-                vec![ListItem::new("<no tables>").style(Style::default().fg(Color::DarkGray))]
+                vec![ListItem::new("<no tables>").style(Style::default().fg(text_muted))]
             } else {
                 tables
                     .iter()
                     .enumerate()
                     .map(|(i, t)| {
                         let style = if i == app.table_picker.selected {
-                            Style::default().bg(Color::DarkGray).fg(Color::White)
+                            Style::default().bg(select_bg).fg(text_primary)
                         } else {
-                            Style::default().fg(Color::White)
+                            Style::default().fg(text_primary)
                         };
                         ListItem::new(t.as_str()).style(style)
                     })
