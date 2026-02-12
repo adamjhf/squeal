@@ -942,7 +942,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         ])
         .split(f.area());
 
-    let syntax_highlighter = SyntaxHighlighter::new("one-dark", "sql").ok();
+    let syntax_highlighter = SyntaxHighlighter::new("charcoal", "sql").ok();
     let mode_str = match app.editor_state.mode {
         EditorMode::Insert => "INSERT",
         EditorMode::Normal => "NORMAL",

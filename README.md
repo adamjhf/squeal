@@ -5,7 +5,7 @@ A keyboard-first SQLite TUI for writing queries, browsing results, and iterating
 ## Highlights
 
 - vim-style editing modes (`insert` / `normal`) via `edtui`
-- SQL syntax highlighting (`one-dark`)
+- SQL syntax highlighting
 - schema-aware autocomplete in insert mode
   - table suggestions after `from`/`join`/`into`/`update`
   - column suggestions after `select` / `on`
