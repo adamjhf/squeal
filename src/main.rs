@@ -279,7 +279,7 @@ impl App {
         }
 
         let current_line = text.lines().nth(line).unwrap_or("");
-        let before_cursor = &current_line[..col.min(current_line.len())];
+        let before_cursor = prefix_at_char(current_line, col);
 
         let word_start = before_cursor
             .rfind(|c: char| !c.is_alphanumeric() && c != '_')
@@ -299,7 +299,7 @@ impl App {
             CompletionKind::Column => 0,
             CompletionKind::Keyword => 2,
         };
-        if current_word.len() < min_prefix_len {
+        if current_word.chars().count() < min_prefix_len {
             self.autocomplete.visible = false;
             return;
         }
@@ -563,13 +563,15 @@ impl App {
         }
 
         let current_line = text.lines().nth(line).unwrap_or("");
-        let before_cursor = &current_line[..col.min(current_line.len())];
+        let before_cursor = prefix_at_char(current_line, col);
         let word_start = before_cursor
             .rfind(|c: char| !c.is_alphanumeric() && c != '_')
             .map(|i| i + 1)
             .unwrap_or(0);
+        let current_word = &before_cursor[word_start..];
+        let current_word_chars = current_word.chars().count();
 
-        for _ in word_start..col {
+        for _ in 0..current_word_chars {
             use crossterm::event::KeyEvent;
             self.event_handler
                 .on_key_event(KeyEvent::from(KeyCode::Backspace), &mut self.editor_state);
@@ -843,8 +845,21 @@ fn qualifier_before_word(before_cursor: &str, word_start: usize) -> Option<Strin
     if q.is_empty() { None } else { Some(q.to_string()) }
 }
 
+fn prefix_at_char(s: &str, char_col: usize) -> &str {
+    if char_col == 0 {
+        return "";
+    }
+    for (count, (idx, _)) in s.char_indices().enumerate() {
+        if count == char_col {
+            return &s[..idx];
+        }
+    }
+    s
+}
+
 fn truncate_left(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
         return s.to_string();
     }
     if max == 0 {
@@ -853,11 +868,14 @@ fn truncate_left(s: &str, max: usize) -> String {
     if max == 1 {
         return "…".to_string();
     }
-    format!("…{}", &s[s.len() - (max - 1)..])
+    let start = chars.len().saturating_sub(max - 1);
+    let tail: String = chars[start..].iter().collect();
+    format!("…{}", tail)
 }
 
 fn truncate_right(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
         return s.to_string();
     }
     if max == 0 {
@@ -866,7 +884,8 @@ fn truncate_right(s: &str, max: usize) -> String {
     if max == 1 {
         return "…".to_string();
     }
-    format!("{}…", &s[..max - 1])
+    let head: String = chars[..max - 1].iter().collect();
+    format!("{}…", head)
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
@@ -946,7 +965,8 @@ fn ui(f: &mut Frame, app: &mut App) {
         app.results[start_row..end_row].iter().enumerate().map(|(i, row)| {
             let global_i = i + start_row;
             let row_end = start_col + headers_slice.len().min(row.len().saturating_sub(start_col));
-            let row_slice = &row[start_col..end_col.min(row_end)];
+            let row_slice: &[String] =
+                if start_col < row.len() { &row[start_col..end_col.min(row_end)] } else { &[] };
             Row::new(row_slice.iter().enumerate().map(|(j, cell)| {
                 let local_j = j + start_col;
                 let base_style = if global_i.is_multiple_of(2) {
@@ -1049,42 +1069,44 @@ fn ui(f: &mut Frame, app: &mut App) {
         let popup_y = area.y + area.height.saturating_sub(popup_height) / 2;
         let popup = Rect::new(popup_x, popup_y, popup_width, popup_height);
 
-        f.render_widget(Clear, popup);
-        let block = Block::default().borders(Borders::ALL).title("Tables");
-        f.render_widget(block, popup);
+        if popup.width >= 3 && popup.height >= 3 {
+            f.render_widget(Clear, popup);
+            let block = Block::default().borders(Borders::ALL).title("Tables");
+            f.render_widget(block, popup);
 
-        let inner = Rect::new(
-            popup.x + 1,
-            popup.y + 1,
-            popup.width.saturating_sub(2),
-            popup.height.saturating_sub(2),
-        );
-        let sections = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(1)])
-            .split(inner);
+            let inner = Rect::new(
+                popup.x + 1,
+                popup.y + 1,
+                popup.width.saturating_sub(2),
+                popup.height.saturating_sub(2),
+            );
+            let sections = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(inner);
 
-        let filter = Paragraph::new(format!("Filter: {}", app.table_picker.filter))
-            .style(Style::default().fg(Color::Yellow));
-        f.render_widget(filter, sections[0]);
+            let filter = Paragraph::new(format!("Filter: {}", app.table_picker.filter))
+                .style(Style::default().fg(Color::Yellow));
+            f.render_widget(filter, sections[0]);
 
-        let items: Vec<ListItem> = if tables.is_empty() {
-            vec![ListItem::new("<no tables>").style(Style::default().fg(Color::DarkGray))]
-        } else {
-            tables
-                .iter()
-                .enumerate()
-                .map(|(i, t)| {
-                    let style = if i == app.table_picker.selected {
-                        Style::default().bg(Color::DarkGray).fg(Color::White)
-                    } else {
-                        Style::default().fg(Color::White)
-                    };
-                    ListItem::new(t.as_str()).style(style)
-                })
-                .collect()
-        };
-        f.render_widget(List::new(items), sections[1]);
+            let items: Vec<ListItem> = if tables.is_empty() {
+                vec![ListItem::new("<no tables>").style(Style::default().fg(Color::DarkGray))]
+            } else {
+                tables
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let style = if i == app.table_picker.selected {
+                            Style::default().bg(Color::DarkGray).fg(Color::White)
+                        } else {
+                            Style::default().fg(Color::White)
+                        };
+                        ListItem::new(t.as_str()).style(style)
+                    })
+                    .collect()
+            };
+            f.render_widget(List::new(items), sections[1]);
+        }
     }
 }
 
