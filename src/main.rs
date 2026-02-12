@@ -1423,3 +1423,136 @@ async fn main() -> Result<()> {
     res?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::*;
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        env::temp_dir().join(format!("squeal-test-{}-{}-{}", name, std::process::id(), nanos))
+    }
+
+    fn test_app_with_schema(schema: Schema) -> App {
+        let mut editor_state = EditorState::default();
+        editor_state.mode = EditorMode::Insert;
+        App {
+            editor_state,
+            event_handler: EditorEventHandler::default(),
+            database_path: "/tmp/test.db".to_string(),
+            results: Vec::new(),
+            headers: Vec::new(),
+            status: "ready".to_string(),
+            current_row: 0,
+            current_col: 0,
+            vertical_scroll: 0,
+            horizontal_scroll: 0,
+            visible_rows: 10,
+            visible_cols: 5,
+            autocomplete: AutocompleteState {
+                suggestions: Vec::new(),
+                selected: 0,
+                visible: false,
+            },
+            schema,
+            focus: Pane::Editor,
+            query_history: Vec::new(),
+            history_index: None,
+            history_draft: None,
+            history_path: unique_temp_path("history"),
+            table_picker: TablePickerState { visible: false, filter: String::new(), selected: 0 },
+        }
+    }
+
+    #[test]
+    fn completion_kind_context_rules() {
+        assert_eq!(completion_kind("select "), CompletionKind::Column);
+        assert_eq!(completion_kind("select id from "), CompletionKind::Table);
+        assert_eq!(completion_kind("select * from users join "), CompletionKind::Table);
+        assert_eq!(completion_kind("select * from users on "), CompletionKind::Column);
+        assert_eq!(completion_kind("select * from users where "), CompletionKind::Keyword);
+    }
+
+    #[test]
+    fn truncate_helpers_are_unicode_safe() {
+        assert_eq!(truncate_left("abcdef", 4), "…def");
+        assert_eq!(truncate_right("abcdef", 4), "abc…");
+        assert_eq!(truncate_left("猫犬鳥", 2), "…鳥");
+        assert_eq!(truncate_right("猫犬鳥", 2), "猫…");
+    }
+
+    #[test]
+    fn prefix_at_char_respects_char_boundaries() {
+        let s = "a猫b";
+        assert_eq!(prefix_at_char(s, 0), "");
+        assert_eq!(prefix_at_char(s, 1), "a");
+        assert_eq!(prefix_at_char(s, 2), "a猫");
+        assert_eq!(prefix_at_char(s, 3), "a猫b");
+        assert_eq!(prefix_at_char(s, 10), "a猫b");
+    }
+
+    #[test]
+    fn per_db_history_paths_differ() {
+        let p1 = history_file_path_for_database(Path::new("/tmp/a.db"))
+            .expect("path generation for first db should succeed");
+        let p2 = history_file_path_for_database(Path::new("/tmp/b.db"))
+            .expect("path generation for second db should succeed");
+        assert_ne!(p1, p2);
+    }
+
+    #[test]
+    fn history_roundtrip_preserves_queries() {
+        let path = unique_temp_path("roundtrip");
+        let history =
+            vec!["select 1;".to_string(), "select first_name from employees;".to_string()];
+        save_query_history(&path, &history).expect("history should save");
+        let loaded = load_query_history(&path).expect("history should load");
+        assert_eq!(loaded, history);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn append_run_query_skips_consecutive_duplicates() {
+        let schema = Schema {
+            tables: vec![],
+            columns: vec![],
+            columns_by_table: std::collections::HashMap::new(),
+        };
+        let mut app = test_app_with_schema(schema);
+        app.append_run_query_to_history("select 1;");
+        app.append_run_query_to_history("select 1;");
+        app.append_run_query_to_history("select 2;");
+        app.append_run_query_to_history("select 2;");
+        assert_eq!(app.query_history, vec!["select 1;".to_string(), "select 2;".to_string()]);
+    }
+
+    #[test]
+    fn table_picker_applies_select_with_columns_in_order() {
+        let mut columns_by_table = std::collections::HashMap::new();
+        columns_by_table.insert(
+            "employees".to_string(),
+            vec!["id".to_string(), "first_name".to_string(), "last_name".to_string()],
+        );
+        let schema = Schema {
+            tables: vec!["employees".to_string()],
+            columns: vec!["id".to_string(), "first_name".to_string(), "last_name".to_string()],
+            columns_by_table,
+        };
+        let mut app = test_app_with_schema(schema);
+        app.open_table_picker();
+        let selected = app.table_picker_apply_selection();
+        assert!(selected);
+        assert_eq!(
+            app.current_query(),
+            "select id, first_name, last_name from employees limit 100;"
+        );
+    }
+}
