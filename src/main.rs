@@ -997,34 +997,45 @@ fn ui(f: &mut Frame, app: &mut App) {
         let cursor_row = cursor.row as u16;
         let cursor_col = cursor.col as u16;
 
-        let popup_width =
+        let desired_width =
             app.autocomplete.suggestions.iter().map(|s| s.len()).max().unwrap_or(20).max(20) as u16;
-        let popup_height = app.autocomplete.suggestions.len().min(8) as u16;
+        let desired_height = app.autocomplete.suggestions.len().min(8) as u16;
+        let editor = chunks[0];
+        let editor_right = editor.x.saturating_add(editor.width);
+        let editor_bottom = editor.y.saturating_add(editor.height);
 
-        let popup_x = chunks[0].x + cursor_col + 2;
-        let popup_y = chunks[0].y + cursor_row + 2;
+        let desired_x = editor.x.saturating_add(cursor_col).saturating_add(2);
+        let desired_y = editor.y.saturating_add(cursor_row).saturating_add(2);
+        let max_x = editor_right.saturating_sub(1);
+        let max_y = editor_bottom.saturating_sub(1);
+        let popup_x = desired_x.min(max_x);
+        let popup_y = desired_y.min(max_y);
+        let popup_width = desired_width.min(editor_right.saturating_sub(popup_x));
+        let popup_height = desired_height.min(editor_bottom.saturating_sub(popup_y));
 
-        let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+        if popup_width > 0 && popup_height > 0 {
+            let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
 
-        let items: Vec<ListItem> = app
-            .autocomplete
-            .suggestions
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                let style = if i == app.autocomplete.selected {
-                    Style::default().bg(Color::DarkGray).fg(Color::White)
-                } else {
-                    Style::default().bg(Color::Black).fg(Color::White)
-                };
-                ListItem::new(s.as_str()).style(style)
-            })
-            .collect();
+            let items: Vec<ListItem> = app
+                .autocomplete
+                .suggestions
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let style = if i == app.autocomplete.selected {
+                        Style::default().bg(Color::DarkGray).fg(Color::White)
+                    } else {
+                        Style::default().bg(Color::Black).fg(Color::White)
+                    };
+                    ListItem::new(s.as_str()).style(style)
+                })
+                .collect();
 
-        let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
+            let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
 
-        f.render_widget(Clear, popup_area);
-        f.render_widget(list, popup_area);
+            f.render_widget(Clear, popup_area);
+            f.render_widget(list, popup_area);
+        }
     }
 
     if matches!(app.editor_state.mode, EditorMode::Normal) && app.table_picker.visible {
